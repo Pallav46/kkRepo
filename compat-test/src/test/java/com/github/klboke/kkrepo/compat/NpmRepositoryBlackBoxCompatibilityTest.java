@@ -55,6 +55,399 @@ class NpmRepositoryBlackBoxCompatibilityTest {
       .build();
 
   @Test
+  void proxyDownloadsScopedTarballFromDeclaredUpstreamUrlLikeNexus() throws Exception {
+    verifyScopedUpstream(null);
+  }
+
+  @Test
+  void npmInstallsScopedTarballFromDeclaredUpstreamUrlLikeNexus(@TempDir Path tempDir) throws Exception {
+    assumeTrue(npmAvailable(), "Requires npm client");
+    verifyScopedUpstream(tempDir);
+  }
+
+  @Test
+  void coldLockfileDownloadsEncodedScopedTarballWithoutPriorMetadata() throws Exception {
+    verifyScopedUpstream(null, true);
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void mixedTarballPathsInstallFromAuthenticatedPackumentAndRemainCached(@TempDir Path tempDir) throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeTrue(config.configured() && config.writeEnabled() && npmAvailable(), "Requires Nexus, kkRepo, and npm");
+    String host = setting("compat.npm.upstreamHost", "NPM_COMPAT_UPSTREAM_HOST").orElse("host.docker.internal");
+    String packageName = "@compat/mixed-" + System.nanoTime();
+    List<NpmFixture> fixtures = List.of(NpmFixture.create(packageName, "1.0.0"),
+        NpmFixture.create(packageName, "1.1.0"));
+    String basename = packageName.substring(packageName.indexOf('/') + 1);
+    Map<String, byte[]> tarballs = Map.of(
+        packageName + "/-/" + basename + "-1.0.0.tgz", fixtures.get(0).tarball(),
+        packageName + "/-/" + packageName + "-1.1.0.tgz", fixtures.get(1).tarball());
+    var online = new java.util.concurrent.atomic.AtomicBoolean(true);
+    var upstreamRequests = new java.util.concurrent.atomic.AtomicInteger();
+    var upstream = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("0.0.0.0", 0), 0);
+    String remote = "http://" + host + ":" + upstream.getAddress().getPort() + "/artgalaxy/mixed/";
+    Map<String, Object> root = new LinkedHashMap<>(Map.of("name", packageName,
+        "dist-tags", Map.of("latest", "1.1.0")));
+    Map<String, Object> versions = new LinkedHashMap<>();
+    for (NpmFixture fixture : fixtures) {
+      Map<String, Object> doc = MAPPER.readValue(fixture.publishJson(), MAP_TYPE);
+      Map<String, Object> version = version(doc, fixture.version());
+      String suffix = fixture.version().equals("1.0.0") ? basename : packageName;
+      ((Map<String, Object>) version.get("dist")).put("tarball",
+          remote + packageName + "/-/" + suffix + "-" + fixture.version() + ".tgz");
+      versions.put(fixture.version(), version);
+    }
+    root.put("versions", versions);
+    byte[] metadata = MAPPER.writeValueAsBytes(root);
+    String authentication = "Basic " + Base64.getEncoder().encodeToString(
+        "fixture:fixture-password".getBytes(StandardCharsets.UTF_8));
+    upstream.createContext("/artgalaxy/mixed/", exchange -> {
+      upstreamRequests.incrementAndGet();
+      if (!online.get()) {
+        exchange.sendResponseHeaders(503, -1);
+      } else if (!authentication.equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+        exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"fixture\"");
+        exchange.sendResponseHeaders(401, -1);
+      } else {
+        String path = exchange.getRequestURI().getPath().substring("/artgalaxy/mixed/".length());
+        byte[] body = path.equals(packageName) ? metadata : tarballs.get(path);
+        if (body == null) {
+          exchange.sendResponseHeaders(404, -1);
+        } else {
+          exchange.getResponseHeaders().set("Content-Type",
+              path.equals(packageName) ? "application/json" : "application/octet-stream");
+          exchange.sendResponseHeaders(200, body.length);
+          exchange.getResponseBody().write(body);
+        }
+      }
+      exchange.close();
+    });
+    upstream.start();
+    try (var access = allowNpmFixtureHost(config.nexusHosted(), host)) {
+      for (Endpoint endpoint : List.of(config.nexusHosted(), config.nexusPlusHosted())) {
+        boolean nexus = endpoint.baseUrl().equals(config.nexusHosted().baseUrl());
+        online.set(true);
+        String name = "compat-mixed-" + System.nanoTime();
+        Map<String, Object> payload = new LinkedHashMap<>(Map.of("name", name, "online", true));
+        if (nexus) {
+          payload.put("proxy", Map.of("remoteUrl", remote, "contentMaxAge", 1440, "metadataMaxAge", 1440));
+          payload.put("storage", Map.of("blobStoreName", "default", "strictContentTypeValidation", false));
+          payload.put("negativeCache", Map.of("enabled", false, "timeToLive", 1));
+          payload.put("httpClient", Map.of("blocked", false, "autoBlock", false,
+              "authentication", Map.of("type", "username", "username", "fixture", "password", "fixture-password")));
+        } else {
+          payload.put("recipe", "npm-proxy");
+          payload.put("blobStoreName", "default");
+          payload.put("proxy", Map.of("remoteUrl", remote, "autoBlock", false,
+              "contentMaxAgeMinutes", 1440, "metadataMaxAgeMinutes", 1440,
+              "remoteUsername", "fixture", "remotePassword", "fixture-password"));
+        }
+        String catalog = nexus ? "/service/rest/v1/repositories" : "/internal/repositories";
+        assert2xx("create authenticated mixed proxy", adminRequest(endpoint,
+            catalog + (nexus ? "/npm/proxy" : ""), "POST", MAPPER.writeValueAsBytes(payload)));
+        Endpoint proxy = endpoint.withRepository(name);
+        try {
+          // The first real install starts with an empty proxy: no preparatory packument GET.
+          for (NpmFixture fixture : fixtures) {
+            Path project = Files.createDirectories(tempDir.resolve(name + "-" + fixture.version()));
+            Path npmrc = project.resolve(".npmrc");
+            writeNpmConfig(proxy, npmrc);
+            Files.writeString(project.resolve("package.json"), "{\"name\":\"mixed-proxy-test\",\"version\":\"1.0.0\"}");
+            runProcess(List.of("npm", "install", packageName + "@" + fixture.version(),
+                "--userconfig", npmrc.toString(), "--cache", project.resolve("cache").toString(),
+                "--ignore-scripts", "--no-audit", "--no-fund"), project, Duration.ofMinutes(2));
+            assertEquals(fixture.version(), MAPPER.readTree(project.resolve("node_modules")
+                .resolve(packageName).resolve("package.json").toFile()).path("version").asText());
+          }
+          for (String separator : List.of("%2f", "%2F", "/")) {
+            for (String accept : List.of("application/json", "application/vnd.npm.install-v1+json")) {
+              Exchange packument = send(proxy.request(packageName.replace("/", separator)).header("Accept", accept).GET());
+              assertEquals(200, packument.status(), endpoint.name() + " packument " + separator + " " + accept);
+              assertEquals(Set.of("1.0.0", "1.1.0"), versions(MAPPER.readValue(packument.body(), MAP_TYPE)).keySet());
+            }
+          }
+          Map<String, Object> projected = getJson(proxy, packageName.replace("/", "%2f"));
+          Map<String, byte[]> servedTarballs = new LinkedHashMap<>();
+          for (NpmFixture fixture : fixtures) {
+            servedTarballs.put(tarballPath(proxy, projected, fixture.version()), fixture.tarball());
+          }
+          // Nexus advertises basename URLs; kkRepo preserves both complete declared identities.
+          if (!nexus) assertEquals(tarballs.keySet(), servedTarballs.keySet());
+          for (var tarball : servedTarballs.entrySet()) {
+            Exchange download = get(proxy, tarball.getKey());
+            assertEquals(200, download.status(), endpoint.name() + " " + tarball.getKey());
+            assertArrayEquals(tarball.getValue(), download.body());
+          }
+          online.set(false);
+          int requestsBefore = upstreamRequests.get();
+          for (var tarball : servedTarballs.entrySet()) {
+            Exchange cached = get(proxy, tarball.getKey());
+            assertEquals(200, cached.status(), endpoint.name() + " cached " + tarball.getKey());
+            assertArrayEquals(tarball.getValue(), cached.body());
+          }
+          assertEquals(requestsBefore, upstreamRequests.get(), "fresh tarballs must be served from persisted cache");
+          if (!nexus) {
+            Exchange indexed = adminRequest(endpoint,
+                "/service/rest/v1/search/assets?repository=" + name, "GET", null);
+            assertEquals(200, indexed.status());
+            Set<String> persistedPaths = new LinkedHashSet<>();
+            for (var asset : MAPPER.readTree(indexed.body()).path("items")) {
+              persistedPaths.add(asset.path("path").asText());
+            }
+            assertTrue(persistedPaths.containsAll(tarballs.keySet()), "both tarball identities must be indexed");
+            Exchange listing = send(proxy.internalBrowseRequest(packageName).GET());
+            assertEquals(200, listing.status());
+            String scopeDirectory = packageName + "/-/@compat";
+            boolean visibleScope = false;
+            for (var entry : MAPPER.readTree(listing.body()).path("entries")) {
+              if (scopeDirectory.equals(entry.path("path").asText())) visibleScope = true;
+            }
+            assertTrue(visibleScope, "persisted scoped tarballs must remain navigable from the package browse view");
+            Exchange scopedListing = send(proxy.internalBrowseRequest(scopeDirectory).GET());
+            assertEquals(200, scopedListing.status());
+            var scopedEntries = MAPPER.readTree(scopedListing.body()).path("entries");
+            assertEquals(1, scopedEntries.size());
+            assertEquals(packageName + "/-/" + packageName + "-1.1.0.tgz",
+                scopedEntries.get(0).path("path").asText());
+          }
+        } finally {
+          if (!nexus) adminRequest(endpoint, "/internal/browse/" + name + "?path="
+              + URLEncoder.encode(packageName, StandardCharsets.UTF_8) + "&source=" + name, "DELETE", null);
+          assertEquals(204, adminRequest(endpoint, catalog + "/" + name, "DELETE", null).status());
+        }
+      }
+    } finally {
+      upstream.stop(0);
+    }
+  }
+
+  @Test
+  void nestedTarballUrlsRemainRoutableWithoutPriorMetadata() throws Exception {
+    verifyScopedUpstream(null, true, "signed/");
+    verifyScopedUpstream(null, true, "signed/-/");
+    verifyScopedUpstream(null, true, "@cdn/");
+  }
+
+  @Test
+  void revisionLikeTarballSubdirectoriesRemainRoutable() throws Exception {
+    verifyScopedUpstream(null, true, "signed/-rev/");
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void hostedNestedPublishMetadataUsesStoredAttachmentPath() throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeTrue(config.configured() && config.writeEnabled(), "Requires disposable Nexus and kkRepo instances");
+    NpmFixture fixture = NpmFixture.create("@compat/hosted-" + System.nanoTime(), "1.0.0");
+    Map<String, Object> publish = MAPPER.readValue(fixture.publishJson(), MAP_TYPE);
+    ((Map<String, Object>) version(publish, fixture.version()).get("dist")).put("tarball",
+        "https://upstream.example/download/-/" + fixture.packageName() + "-1.0.0.tgz");
+    for (Endpoint endpoint : List.of(config.nexusHosted(), config.nexusPlusHosted())) {
+      boolean nexus = endpoint.baseUrl().equals(config.nexusHosted().baseUrl());
+      String name = "compat-hosted-path-" + System.nanoTime();
+      Map<String, Object> payload = new LinkedHashMap<>(Map.of("name", name, "online", true));
+      if (nexus) {
+        payload.put("storage", Map.of("blobStoreName", "default", "strictContentTypeValidation", false,
+            "writePolicy", "ALLOW"));
+      } else {
+        payload.put("recipe", "npm-hosted");
+        payload.put("blobStoreName", "default");
+        payload.put("hosted", Map.of("writePolicy", "ALLOW"));
+      }
+      String catalog = nexus ? "/service/rest/v1/repositories" : "/internal/repositories";
+      Exchange created = adminRequest(endpoint,
+          catalog + (nexus ? "/npm/hosted" : ""), "POST", MAPPER.writeValueAsBytes(payload));
+      assert2xx(endpoint.name() + " create hosted path fixture: " + new String(created.body(), StandardCharsets.UTF_8), created);
+      Endpoint hosted = endpoint.withRepository(name);
+      try {
+        assert2xx("publish nested metadata", putJson(hosted, fixture.packageName(), MAPPER.writeValueAsBytes(publish)));
+        Map<String, Object> rewritten = getJson(hosted, fixture.packageName().replace("/", "%2f"));
+        String path = tarballPath(hosted, rewritten, fixture.version());
+        assertEquals(fixture.packageName() + "/-/"
+            + fixture.packageName().substring(fixture.packageName().indexOf('/') + 1) + "-1.0.0.tgz", path);
+        Exchange download = get(hosted, path);
+        assertEquals(200, download.status());
+        assertArrayEquals(fixture.tarball(), download.body());
+        assertEquals(200, head(hosted, path).status());
+        String groupName = name + "-group";
+        Map<String, Object> groupPayload = new LinkedHashMap<>(Map.of(
+            "name", groupName, "online", true, "group", Map.of("memberNames", List.of(name))));
+        if (nexus) {
+          groupPayload.put("storage", Map.of("blobStoreName", "default", "strictContentTypeValidation", false));
+        } else {
+          groupPayload.put("recipe", "npm-group");
+          groupPayload.put("blobStoreName", "default");
+        }
+        assert2xx("create hosted group path fixture", adminRequest(endpoint,
+            catalog + (nexus ? "/npm/group" : ""), "POST", MAPPER.writeValueAsBytes(groupPayload)));
+        Endpoint group = endpoint.withRepository(groupName);
+        try {
+          for (int read = 0; read < 2; read++) {
+            Map<String, Object> groupRoot = getJson(group, fixture.packageName().replace("/", "%2f"));
+            String groupPath = tarballPath(group, groupRoot, fixture.version());
+            assertEquals(path, groupPath, "fresh and cached group metadata must retain the attachment path");
+            Exchange groupDownload = get(group, groupPath);
+            assertEquals(200, groupDownload.status());
+            assertArrayEquals(fixture.tarball(), groupDownload.body());
+          }
+        } finally {
+          assertEquals(204, adminRequest(endpoint, catalog + "/" + groupName, "DELETE", null).status());
+        }
+      } finally {
+        if (!nexus) adminRequest(endpoint, "/internal/browse/" + name + "?path="
+            + URLEncoder.encode(fixture.packageName(), StandardCharsets.UTF_8) + "&source=" + name, "DELETE", null);
+        assertEquals(204, adminRequest(endpoint, catalog + "/" + name, "DELETE", null).status());
+      }
+    }
+  }
+
+  private void verifyScopedUpstream(Path installRoot) throws Exception {
+    verifyScopedUpstream(installRoot, false);
+  }
+
+  @SuppressWarnings("unchecked")
+  private void verifyScopedUpstream(Path installRoot, boolean coldLockfile) throws Exception {
+    verifyScopedUpstream(installRoot, coldLockfile, "");
+  }
+
+  @SuppressWarnings("unchecked")
+  private void verifyScopedUpstream(Path installRoot, boolean coldLockfile, String prefix) throws Exception {
+    CompatConfig config = CompatConfig.load();
+    assumeTrue(config.configured() && config.writeEnabled(), "Requires disposable Nexus and kkRepo instances");
+    String host = setting("compat.npm.upstreamHost", "NPM_COMPAT_UPSTREAM_HOST").orElse("host.docker.internal");
+    NpmFixture fixture = NpmFixture.create("@compat/scoped-" + System.nanoTime(), "0.1.1-beta.1");
+    String tarballPath = fixture.packageName() + "/-/" + fixture.packageName() + "-" + fixture.version() + ".tgz";
+    String encodedName = (prefix.isEmpty() ? fixture.packageName().replace("/", "%2F")
+        : prefix + fixture.packageName().substring(fixture.packageName().indexOf('/') + 1))
+        + "-" + fixture.version() + ".tgz";
+    String advertisedPath = coldLockfile ? "downloads/" + fixture.packageName() + "/-/" + encodedName : tarballPath;
+    var upstream = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("0.0.0.0", 0), 0);
+    String remote = "http://" + host + ":" + upstream.getAddress().getPort() + "/artgalaxy/test/";
+    Map<String, Object> root = MAPPER.readValue(fixture.publishJson(), MAP_TYPE);
+    root.remove("_attachments");
+    ((Map<String, Object>) version(root, fixture.version()).get("dist")).put("tarball", remote + advertisedPath + (coldLockfile ? "?token=signed" : ""));
+    byte[] metadata = MAPPER.writeValueAsBytes(root);
+    upstream.createContext("/artgalaxy/test/", exchange -> {
+      String path = exchange.getRequestURI().getPath().substring("/artgalaxy/test/".length());
+      String rawPath = exchange.getRequestURI().getRawPath().substring("/artgalaxy/test/".length());
+      boolean correctTarball = coldLockfile
+          ? rawPath.equals(advertisedPath) && "token=signed".equals(exchange.getRequestURI().getRawQuery())
+          : path.equals(tarballPath);
+      byte[] body = path.equals(fixture.packageName()) ? metadata : correctTarball ? fixture.tarball() : null;
+      if (body == null) { exchange.sendResponseHeaders(404, -1); }
+      else {
+        exchange.getResponseHeaders().set("Content-Type", path.endsWith(".tgz") ? "application/octet-stream" : "application/json");
+        exchange.sendResponseHeaders(200, body.length);
+        exchange.getResponseBody().write(body);
+      }
+      exchange.close();
+    });
+    upstream.start();
+    try (var fixtureAccess = allowNpmFixtureHost(config.nexusHosted(), host)) {
+      for (Endpoint endpoint : List.of(config.nexusHosted(), config.nexusPlusHosted())) {
+        boolean nexus = endpoint.baseUrl().equals(config.nexusHosted().baseUrl());
+        String name = "compat-scoped-" + System.nanoTime();
+        var payload = new LinkedHashMap<String, Object>();
+        payload.put("name", name);
+        payload.put("online", true);
+        payload.put("proxy", nexus
+            ? Map.of("remoteUrl", remote, "contentMaxAge", 1440, "metadataMaxAge", 1440)
+            : Map.of("remoteUrl", remote, "autoBlock", false));
+        if (nexus) {
+          payload.put("storage", Map.of("blobStoreName", "default", "strictContentTypeValidation", false));
+          payload.put("negativeCache", Map.of("enabled", false, "timeToLive", 1));
+          payload.put("httpClient", Map.of("blocked", false, "autoBlock", false));
+        } else {
+          payload.put("recipe", "npm-proxy");
+          payload.put("blobStoreName", "default");
+        }
+        String catalog = nexus ? "/service/rest/v1/repositories" : "/internal/repositories";
+        assert2xx("create scoped proxy", adminRequest(endpoint,
+            catalog + (nexus ? "/npm/proxy" : ""), "POST", MAPPER.writeValueAsBytes(payload)));
+        Endpoint proxy = endpoint.withRepository(name);
+        try {
+          if (coldLockfile) {
+            Exchange firstDownload = get(proxy, fixture.packageName() + "/-/" + encodedName);
+            // Nexus 3.94 returns 404 for this custom encoded/signed URL, even after metadata.
+            // kkRepo additionally supports it in direct lockfile downloads against a cold proxy.
+            assertEquals(nexus ? 404 : 200, firstDownload.status(), endpoint.name() + " cold lockfile download");
+            if (!nexus) assertArrayEquals(fixture.tarball(), firstDownload.body());
+          }
+          if (installRoot != null) {
+            Path project = Files.createDirectories(installRoot.resolve(name));
+            Path npmrc = project.resolve(".npmrc");
+            writeNpmConfig(proxy, npmrc);
+            Files.writeString(project.resolve("package.json"), "{\"name\":\"scoped-proxy-test\",\"version\":\"1.0.0\"}");
+            runProcess(List.of("npm", "install", fixture.packageName() + "@" + fixture.version(),
+                "--userconfig", npmrc.toString(), "--cache", project.resolve("cache").toString(),
+                "--ignore-scripts", "--no-audit", "--no-fund"), project, Duration.ofMinutes(2));
+            var installed = MAPPER.readTree(project.resolve("node_modules").resolve(fixture.packageName())
+                .resolve("package.json").toFile());
+            assertEquals(fixture.packageName(), installed.path("name").asText());
+            assertEquals(fixture.version(), installed.path("version").asText());
+          }
+          Map<String, Object> rewritten = getJson(proxy, fixture.packageName().replace("/", "%2f"));
+          Exchange result = get(proxy, tarballPath(proxy, rewritten, fixture.version()));
+          int expectedStatus = nexus && coldLockfile ? 404 : 200;
+          assertEquals(expectedStatus, result.status(), endpoint.name() + " declared tarball");
+          if (expectedStatus == 200) assertArrayEquals(fixture.tarball(), result.body());
+          assertEquals(expectedStatus, head(proxy, tarballPath(proxy, rewritten, fixture.version())).status());
+          if (!nexus) {
+            Exchange scopedLockfile = get(proxy, tarballPath);
+            if (prefix.isEmpty()) {
+              assertEquals(200, scopedLockfile.status());
+              assertArrayEquals(fixture.tarball(), scopedLockfile.body(), "scoped URL from a lockfile");
+            } else {
+              assertEquals(404, scopedLockfile.status(), "unadvertised scoped directory must not alias the declared path");
+            }
+            String basename = fixture.packageName().substring(fixture.packageName().indexOf('/') + 1)
+                + "-" + fixture.version() + ".tgz";
+            Exchange legacyBasename = get(proxy, fixture.packageName() + "/-/" + basename);
+            assertEquals(200, legacyBasename.status());
+            assertArrayEquals(fixture.tarball(), legacyBasename.body(), "legacy basename-only lockfile alias");
+          }
+        } finally {
+          if (!nexus) adminRequest(endpoint, "/internal/browse/" + name + "?path="
+              + URLEncoder.encode(fixture.packageName(), StandardCharsets.UTF_8) + "&source=" + name, "DELETE", null);
+          assertEquals(204, adminRequest(endpoint, catalog + "/" + name, "DELETE", null).status());
+        }
+      }
+    } finally {
+      upstream.stop(0);
+    }
+  }
+
+  private static AutoCloseable allowNpmFixtureHost(Endpoint nexus, String host) throws Exception {
+    String path = "/service/rest/v1/security/ssrf-protection";
+    Exchange response = adminRequest(nexus, path, "GET", null);
+    if (response.status() == 404) return () -> {};
+    assertEquals(200, response.status());
+    var config = (com.fasterxml.jackson.databind.node.ObjectNode) MAPPER.readTree(response.body());
+    String field = host.matches("[0-9.]+") ? "allowedIPs" : "allowedDomains";
+    var allowed = config.withArray(field);
+    for (var entry : allowed) if (host.equals(entry.asText())) return () -> {};
+    allowed.add(host);
+    assertEquals(200, adminRequest(nexus, path, "PUT", MAPPER.writeValueAsBytes(config)).status());
+    return () -> {
+      Exchange latest = adminRequest(nexus, path, "GET", null);
+      assertEquals(200, latest.status());
+      var restored = (com.fasterxml.jackson.databind.node.ObjectNode) MAPPER.readTree(latest.body());
+      var entries = restored.withArray(field);
+      for (int i = entries.size() - 1; i >= 0; i--) if (host.equals(entries.get(i).asText())) entries.remove(i);
+      assertEquals(200, adminRequest(nexus, path, "PUT", MAPPER.writeValueAsBytes(restored)).status());
+    };
+  }
+
+  private static Exchange adminRequest(Endpoint endpoint, String path, String method, byte[] body) throws Exception {
+    var builder = HttpRequest.newBuilder(URI.create(endpoint.baseUrl().orElseThrow() + path))
+        .header("Content-Type", "application/json");
+    endpoint.addAuth(builder);
+    return send(builder.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
+        : HttpRequest.BodyPublishers.ofByteArray(body)));
+  }
+
+  @Test
   void hostedPublishTarballAndDistTagsMatchNexusWhenConfigured() throws Exception {
     CompatConfig config = CompatConfig.load();
     assumeTrue(config.configured(),
@@ -662,16 +1055,7 @@ class NpmRepositoryBlackBoxCompatibilityTest {
       Path npmrc,
       Path workingDirectory) throws Exception {
     String registry = endpoint.repositoryUrl();
-    StringBuilder config = new StringBuilder("registry=").append(registry).append('\n');
-    if (endpoint.username().isPresent() && endpoint.password().isPresent()) {
-      URI registryUri = URI.create(registry);
-      String authScope = "//" + registryUri.getRawAuthority() + registryUri.getRawPath();
-      String credentials = Base64.getEncoder().encodeToString(
-          (endpoint.username().get() + ":" + endpoint.password().get())
-              .getBytes(StandardCharsets.UTF_8));
-      config.append(authScope).append(":_auth=").append(credentials).append('\n');
-    }
-    Files.writeString(npmrc, config, StandardCharsets.UTF_8);
+    writeNpmConfig(endpoint, npmrc);
     runProcess(
         List.of(
             "npm",
@@ -684,6 +1068,20 @@ class NpmRepositoryBlackBoxCompatibilityTest {
             "--ignore-scripts"),
         workingDirectory,
         Duration.ofMinutes(5));
+  }
+
+  private static void writeNpmConfig(Endpoint endpoint, Path npmrc) throws IOException {
+    String registry = endpoint.repositoryUrl();
+    StringBuilder config = new StringBuilder("registry=").append(registry).append('\n');
+    if (endpoint.username().isPresent() && endpoint.password().isPresent()) {
+      URI registryUri = URI.create(registry);
+      String authScope = "//" + registryUri.getRawAuthority() + registryUri.getRawPath();
+      String credentials = Base64.getEncoder().encodeToString(
+          (endpoint.username().get() + ":" + endpoint.password().get())
+              .getBytes(StandardCharsets.UTF_8));
+      config.append(authScope).append(":_auth=").append(credentials).append('\n');
+    }
+    Files.writeString(npmrc, config, StandardCharsets.UTF_8);
   }
 
   private static void assertPublishedDigests(

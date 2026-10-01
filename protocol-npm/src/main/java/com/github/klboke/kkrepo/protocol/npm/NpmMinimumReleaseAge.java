@@ -171,7 +171,7 @@ public final class NpmMinimumReleaseAge {
       return null;
     }
     Object rawTarball = dist.get(NpmMetadata.TARBALL);
-    return rawTarball == null ? null : NpmMetadata.extractTarballName(rawTarball.toString());
+    return rawTarball == null ? null : NpmMetadata.canonicalTarballName(rawTarball.toString());
   }
 
   @SuppressWarnings("unchecked")
@@ -439,7 +439,8 @@ public final class NpmMinimumReleaseAge {
     }
 
     public List<String> versionsForTarball(String tarballName) {
-      String expected = NpmMetadata.extractTarballName(tarballName);
+      String expected = tarballVersions.containsKey(tarballName) ? tarballName
+          : NpmTarballCompatibility.legacyBasenameAlias(tarballVersions.keySet(), tarballName);
       if (expected == null) {
         return List.of();
       }

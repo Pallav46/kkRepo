@@ -276,6 +276,66 @@ class NpmMinimumReleaseAgeTest {
   }
 
   @Test
+  void distinctScopedPathsDoNotShareEligibilityThroughTheirBasename() {
+    Instant now = Instant.parse("2026-07-19T12:00:00Z");
+    Map<String, Object> root = Map.of("versions", Map.of(
+        "1.0.0", Map.of("dist", Map.of("tarball", "https://registry.example/pkg.tgz")),
+        "2.0.0", Map.of("dist", Map.of("tarball", "https://registry.example/@abc%2Fpkg.tgz"))),
+        "time", Map.of("1.0.0", now.minusSeconds(7200).toString(), "2.0.0", now.minusSeconds(10).toString()));
+    var analysis = NpmMinimumReleaseAge.analyze(root, 60);
+    assertEquals(List.of("1.0.0"), analysis.versionsForTarball("pkg.tgz"));
+    assertEquals("1.0.0", NpmMetadata.findVersionForTarball(root, "pkg.tgz"));
+    assertEquals("2.0.0", NpmMetadata.findVersionForTarball(root, "@abc/pkg.tgz"));
+    assertEquals(List.of("2.0.0"), analysis.versionsForTarball("@abc/pkg.tgz"));
+    assertEquals(List.of("2.0.0"), analysis.versionsForTarball(new NpmPathParser().parse("@abc/demo/-/@abc%2Fpkg.tgz").tarballName()));
+    assertEquals(null, NpmTarballCompatibility.legacyBasenameAlias(List.of("@a/pkg.tgz", "@b/pkg.tgz"), "pkg.tgz"));
+  }
+
+  @Test
+  void nestedTarballDelimitersAndAliasesPreserveExactReleaseIdentity() {
+    String oldUrl = "https://registry.example/demo/-/old/-/demo.tgz";
+    String youngUrl = "https://registry.example/demo/-/young/-/demo.tgz";
+    Map<String, Object> root = Map.of("versions", Map.of(
+        "1.0.0", Map.of("dist", Map.of("tarball", oldUrl)),
+        "2.0.0", Map.of("dist", Map.of("tarball", youngUrl))),
+        "time", Map.of("1.0.0", NOW.minusSeconds(7200).toString(), "2.0.0", NOW.toString()));
+    var analysis = NpmMinimumReleaseAge.analyze(root, 60);
+    assertEquals("old/-/demo.tgz", NpmMetadata.tarballFilename(oldUrl));
+    assertEquals(List.of("1.0.0"), analysis.versionsForTarball("old/-/demo.tgz"));
+    assertEquals(List.of("2.0.0"), analysis.versionsForTarball("young/-/demo.tgz"));
+    assertTrue(analysis.versionsForTarball("demo.tgz").isEmpty());
+    assertEquals("1.0.0", NpmMetadata.findVersionForTarball(root, "old/-/demo.tgz"));
+    assertNull(NpmTarballCompatibility.legacyBasenameAlias(List.of("signed/demo.tgz"), "attacker/demo.tgz"));
+    assertEquals("signed/demo.tgz", NpmTarballCompatibility.legacyBasenameAlias(List.of("signed/demo.tgz"), "demo.tgz"));
+  }
+
+  @Test
+  void scopedEncodedTarballsUseTheSameIdentityInFreshAndPersistedIndexes() {
+    Instant published = Instant.parse("2026-01-01T00:00:00Z");
+    String url = "https://registry.example/@abc/abc-ui/-/@abc%2Fabc-ui-1.0.0.tgz?token=1";
+    Map<String, Object> root = Map.of(
+        "versions", Map.of("1.0.0", Map.of("dist", Map.of("tarball", url))),
+        "time", Map.of("1.0.0", published.toString()));
+    var index = NpmMinimumReleaseAge.index(root);
+    assertEquals("@abc/abc-ui-1.0.0.tgz", index.releases().getFirst().tarballName());
+    var persisted = new NpmMinimumReleaseAge.ReleaseIndex(List.of(
+        new NpmMinimumReleaseAge.IndexedRelease("1.0.0", published, null, "@abc/abc-ui-1.0.0.tgz")));
+    for (var candidate : List.of(index, persisted)) {
+      var analysis = NpmMinimumReleaseAge.analyze(candidate, 60);
+      for (String name : List.of("abc-ui-1.0.0.tgz", "@abc/abc-ui-1.0.0.tgz", "@abc%2Fabc-ui-1.0.0.tgz")) {
+        assertEquals(List.of("1.0.0"), analysis.versionsForTarball(
+            new NpmPathParser().parse("@abc/abc-ui/-/" + name).tarballName()));
+      }
+    }
+    assertEquals("demo-1.0.0+build.tgz", NpmMetadata.canonicalTarballName("demo-1.0.0+build.tgz"));
+    assertEquals(null, NpmMetadata.canonicalTarballName("bad%XX.tgz"));
+    String literal = NpmMetadata.canonicalTarballName("https://registry.example/%2541.tgz");
+    assertEquals("%41.tgz", literal);
+    assertEquals(literal, NpmTarballCompatibility.legacyBasenameAlias(List.of(literal), "%41.tgz"));
+    assertEquals(null, NpmTarballCompatibility.legacyBasenameAlias(List.of(literal), "A.tgz"));
+  }
+
+  @Test
   @SuppressWarnings("unchecked")
   void findsEveryVersionThatSharesATarballFilename() {
     Map<String, Object> root = packument(

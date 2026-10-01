@@ -1,6 +1,7 @@
 package com.github.klboke.kkrepo.server.npm;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -35,6 +36,7 @@ import com.github.klboke.kkrepo.server.maven.MavenResponse;
 import com.github.klboke.kkrepo.server.maven.ProxyNegativeCache;
 import com.github.klboke.kkrepo.server.maven.RepositoryRuntime;
 import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -394,7 +396,8 @@ class NpmProxyRuntimeTest {
     when(fixture.writer.writeTarball(
         eq(runtime), eq(fixture.storage), eq(7L), eq(PACKAGE), eq("1.0.0"), eq(TARBALL),
         any(), eq("application/octet-stream"), eq("proxy"), isNull(),
-        eq(Map.of("remoteEtag", "tar")), eq(false)))
+        eq(Map.of("remoteEtag", "tar", "npmTarballSourceUrlHash",
+            sourceHash("https://registry.npmjs.org/" + TARBALL_PATH))), eq(false)))
         .thenReturn(stored(TARBALL_PATH, "tarball", "application/octet-stream"));
 
     MavenResponse response = fixture.service.getTarball(runtime, PACKAGE, TARBALL, true);
@@ -520,6 +523,328 @@ class NpmProxyRuntimeTest {
         path(NpmPath.Kind.DIST_TAGS, null), "base", false));
     assertThrows(NpmExceptions.NpmNotFoundException.class, () -> fixture.service.get(
         runtime, path(NpmPath.Kind.UNKNOWN, null), "base", false));
+  }
+
+  @Test
+  void tarballUsesPersistedPackumentUrlIncludingScopePrefixEncodingAndQuery() throws Exception {
+    var runtime = runtime(60, 7L);
+    var pkg = NpmPackageId.parse("@abc/abc-ui");
+    for (String scopedFilename : List.of("@abc/", "@abc%2F", "%40abc%2f")) {
+      String original = "https://registry.npmjs.org/artgalaxy/repo/@abc%2fabc-ui/-/"
+          + scopedFilename + "abc-ui-0.1.1-beta.1.tgz?download=1";
+      for (String name : List.of("abc-ui-0.1.1-beta.1.tgz", "@abc/abc-ui-0.1.1-beta.1.tgz")) {
+        Fixture fixture = fixture();
+        when(fixture.hosted.packageRoot(runtime, pkg)).thenReturn(Optional.of(Map.of("versions", Map.of(
+            "0.1.1-beta.1", Map.of("dist", Map.of("tarball", original))))));
+        respond(fixture.fetcher, new HttpRemoteFetcher.Result(404, Map.of(), InputStream.nullInputStream()));
+        assertThrows(NpmExceptions.NpmNotFoundException.class,
+            () -> fixture.service.getTarball(runtime, pkg, name, false));
+        var request = ArgumentCaptor.forClass(HttpRemoteFetcher.Request.class);
+        verify(fixture.fetcher).fetchWithBodyRetry(request.capture(), eq(pkg.tarballPath(name)), any());
+        assertEquals(original, request.getValue().url());
+        assertEquals("registry.npmjs.org", request.getValue().trustedHost());
+      }
+    }
+  }
+
+  @Test
+  void refreshesStalePackumentBeforeLockfileDownload() throws Exception {
+    Fixture fixture = fixture();
+    var runtime = runtime(1, 7L);
+    when(fixture.cache.find(eq(10L), eq("demo"), any())).thenReturn(Optional.of(
+        snapshot("demo", Instant.EPOCH, "package-root", Map.of())));
+    when(fixture.registry.forBlobStoreId(7L)).thenReturn(fixture.storage);
+    String refreshed = "https://registry.npmjs.org/custom/demo-1.0.0.tgz?token=fresh";
+    Map<String, Object> root = Map.of("versions", Map.of("1.0.0", Map.of("dist", Map.of("tarball", refreshed))));
+    when(fixture.writer.writePackageRoot(eq(runtime), eq(fixture.storage), eq(7L), eq(PACKAGE),
+        any(), eq("proxy"), isNull(), any())).thenAnswer(invocation -> {
+          when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(root));
+          return stored("demo", "package-root", "application/json");
+        });
+    doAnswer(invocation -> {
+      HttpRemoteFetcher.Request request = invocation.getArgument(0);
+      HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+      if (request.url().endsWith("/demo")) {
+        return handler.handle(new HttpRemoteFetcher.Result(200, Map.of(),
+            new ByteArrayInputStream(new ObjectMapper().writeValueAsBytes(root))));
+      }
+      assertEquals(refreshed, request.url());
+      return handler.handle(new HttpRemoteFetcher.Result(404, Map.of(), InputStream.nullInputStream()));
+    }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+    assertThrows(NpmExceptions.NpmNotFoundException.class,
+        () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, false));
+    verify(fixture.fetcher, org.mockito.Mockito.times(2)).fetchWithBodyRetry(any(), anyString(), any());
+  }
+
+  @Test
+  void fetchesAbsentPackumentBeforeColdLockfileDownload() throws Exception {
+    Fixture fixture = fixture();
+    var runtime = runtime(1, 7L);
+    when(fixture.cache.find(eq(10L), eq("demo"), any())).thenReturn(Optional.empty());
+    when(fixture.registry.forBlobStoreId(7L)).thenReturn(fixture.storage);
+    String refreshed = "https://registry.npmjs.org/custom/demo-1.0.0.tgz?token=fresh";
+    Map<String, Object> root = Map.of("versions", Map.of("1.0.0", Map.of("dist", Map.of("tarball", refreshed))));
+    when(fixture.writer.writePackageRoot(eq(runtime), eq(fixture.storage), eq(7L), eq(PACKAGE),
+        any(), eq("proxy"), isNull(), any())).thenAnswer(invocation -> {
+          when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(root));
+          return stored("demo", "package-root", "application/json");
+        });
+    doAnswer(invocation -> {
+      HttpRemoteFetcher.Request request = invocation.getArgument(0);
+      HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+      if (request.url().endsWith("/demo")) {
+        return handler.handle(new HttpRemoteFetcher.Result(200, Map.of(),
+            new ByteArrayInputStream(new ObjectMapper().writeValueAsBytes(root))));
+      }
+      assertEquals(refreshed, request.url());
+      return handler.handle(new HttpRemoteFetcher.Result(404, Map.of(), InputStream.nullInputStream()));
+    }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+    assertThrows(NpmExceptions.NpmNotFoundException.class,
+        () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, false));
+    verify(fixture.fetcher, org.mockito.Mockito.times(2)).fetchWithBodyRetry(any(), anyString(), any());
+  }
+
+  @Test
+  void staleMetadataFailureFallsBackInsteadOfReusingAnExpiredSignedUrl() throws Exception {
+    for (int status : List.of(404, 410, 503, 0, -1, 304)) {
+      Fixture fixture = fixture();
+      var runtime = runtime(1, 7L);
+      when(fixture.cache.find(eq(10L), eq("demo"), any())).thenReturn(Optional.of(
+          snapshot("demo", Instant.EPOCH, "package-root", Map.of())));
+      String expired = "https://registry.npmjs.org/download/" + TARBALL + "?token=expired";
+      when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+          "1.0.0", Map.of("dist", Map.of("tarball", expired))))));
+      when(fixture.registry.forBlobStoreId(7L)).thenReturn(fixture.storage);
+      when(fixture.writer.writeTarball(eq(runtime), any(), eq(7L), eq(PACKAGE), anyString(), eq(TARBALL),
+          any(), any(), eq("proxy"), isNull(), any(), eq(false)))
+          .thenReturn(stored(TARBALL_PATH, "tarball", "application/octet-stream"));
+      if (status == -1) when(fixture.proxyStateDao.isBlocked(eq(10L), any())).thenReturn(false, true);
+      doAnswer(invocation -> {
+        HttpRemoteFetcher.Request request = invocation.getArgument(0);
+        HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+        if (request.url().endsWith("/demo")) {
+          if (status == 0) throw new java.io.IOException("metadata unavailable");
+          return handler.handle(new HttpRemoteFetcher.Result(status, Map.of(), InputStream.nullInputStream()));
+        }
+        assertEquals(status == 304 ? expired : "https://registry.npmjs.org/" + TARBALL_PATH, request.url());
+        return handler.handle(new HttpRemoteFetcher.Result(200, Map.of(),
+            new ByteArrayInputStream("tarball".getBytes(StandardCharsets.UTF_8))));
+      }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+      assertEquals(200, fixture.service.getTarball(runtime, PACKAGE, TARBALL, true).status());
+      verify(fixture.fetcher, org.mockito.Mockito.times(status == -1 ? 1 : 2)).fetchWithBodyRetry(any(), anyString(), any());
+    }
+  }
+
+  @Test
+  void releaseAgePolicyDoesNotTreatStaleMetadataFallbackAsUrlRevalidation() throws Exception {
+    Instant now = Instant.parse("2026-07-19T12:00:00Z");
+    for (int status : List.of(503, 304)) {
+      Fixture fixture = fixtureWithoutReleaseIndex(Clock.fixed(now, ZoneOffset.UTC));
+      var runtime = runtime(1, 7L, 60);
+      var metadata = snapshot("demo", now.minusSeconds(7200), "package-root", Map.of("npmFullMetadata", "true"));
+      when(fixture.cache.find(eq(10L), eq("demo"), any())).thenReturn(Optional.of(metadata));
+      String expired = "https://registry.npmjs.org/download/" + TARBALL + "?token=expired";
+      when(fixture.hosted.packageRoot(metadata)).thenReturn(Optional.of(Map.of(
+          "time", Map.of("1.0.0", "2026-07-18T12:00:00Z"),
+          "versions", Map.of("1.0.0", Map.of("dist", Map.of("tarball", expired))))));
+      when(fixture.registry.forBlobStoreId(7L)).thenReturn(fixture.storage);
+      when(fixture.writer.writeTarball(eq(runtime), any(), eq(7L), eq(PACKAGE), anyString(), eq(TARBALL),
+          any(), any(), eq("proxy"), isNull(), any(), eq(false)))
+          .thenReturn(stored(TARBALL_PATH, "tarball", "application/octet-stream"));
+      doAnswer(invocation -> {
+        HttpRemoteFetcher.Request request = invocation.getArgument(0);
+        HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+        if (request.url().endsWith("/demo")) {
+          return handler.handle(new HttpRemoteFetcher.Result(status, Map.of(), InputStream.nullInputStream()));
+        }
+        assertEquals(status == 304 ? expired : "https://registry.npmjs.org/" + TARBALL_PATH, request.url());
+        return handler.handle(new HttpRemoteFetcher.Result(200, Map.of(),
+            new ByteArrayInputStream("tarball".getBytes(StandardCharsets.UTF_8))));
+      }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+      assertEquals(200, fixture.service.getTarball(runtime, PACKAGE, TARBALL, true).status());
+      verify(fixture.fetcher, org.mockito.Mockito.times(3)).fetchWithBodyRetry(any(), anyString(), any());
+    }
+  }
+
+  @Test
+  void coldStandardTarballFallsBackWhenMetadataIsTemporarilyUnavailable() throws Exception {
+    for (boolean ioFailure : List.of(false, true)) {
+      Fixture fixture = fixture();
+      var runtime = runtime(1, 7L);
+      when(fixture.cache.find(eq(10L), eq("demo"), any())).thenReturn(Optional.empty());
+      when(fixture.registry.forBlobStoreId(7L)).thenReturn(fixture.storage);
+      when(fixture.writer.writeTarball(eq(runtime), any(), eq(7L), eq(PACKAGE), anyString(), eq(TARBALL),
+          any(), any(), eq("proxy"), isNull(), any(), eq(false)))
+          .thenReturn(stored(TARBALL_PATH, "tarball", "application/octet-stream"));
+      doAnswer(invocation -> {
+        HttpRemoteFetcher.Request request = invocation.getArgument(0);
+        HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+        if (request.url().endsWith("/demo")) {
+          if (ioFailure) throw new java.io.IOException("metadata temporarily unavailable");
+          return handler.handle(new HttpRemoteFetcher.Result(503, Map.of(), InputStream.nullInputStream()));
+        }
+        assertEquals("https://registry.npmjs.org/" + TARBALL_PATH, request.url());
+        return handler.handle(new HttpRemoteFetcher.Result(200, Map.of("Content-Type", "application/octet-stream"),
+            new ByteArrayInputStream("tarball".getBytes(StandardCharsets.UTF_8))));
+      }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+      assertEquals(200, fixture.service.getTarball(runtime, PACKAGE, TARBALL, true).status());
+      verify(fixture.fetcher, org.mockito.Mockito.times(2)).fetchWithBodyRetry(any(), anyString(), any());
+    }
+  }
+
+  @Test
+  void metadataFailureFallbackPreservesIncomingScopedPathEncoding() throws Exception {
+    for (int status : List.of(404, 503, 0)) {
+      for (boolean headOnly : List.of(false, true)) {
+        Fixture fixture = fixture();
+        var runtime = runtime(1, 7L);
+        String rawPath = "@abc%2Fdemo/-/@abc%2Fdemo-1.0.0.tgz";
+        var path = new com.github.klboke.kkrepo.protocol.npm.NpmPathParser().parse(rawPath);
+        when(fixture.cache.find(eq(10L), anyString(), any())).thenReturn(Optional.empty());
+        when(fixture.registry.forBlobStoreId(7L)).thenReturn(fixture.storage);
+        when(fixture.writer.writeTarball(eq(runtime), any(), eq(7L), eq(path.packageId()),
+            anyString(), eq(path.readTarballName()), any(), any(), eq("proxy"), isNull(), any(), eq(!headOnly)))
+            .thenReturn(stored(path.assetPath(), "tarball", "application/octet-stream"));
+        doAnswer(invocation -> {
+          HttpRemoteFetcher.Request request = invocation.getArgument(0);
+          HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+          if (request.url().endsWith("/@abc%2Fdemo")) {
+            if (status == 0) throw new java.io.IOException("metadata unavailable");
+            return handler.handle(new HttpRemoteFetcher.Result(status, Map.of(), InputStream.nullInputStream()));
+          }
+          assertEquals("https://registry.npmjs.org/" + rawPath, request.url());
+          return handler.handle(new HttpRemoteFetcher.Result(200, Map.of(),
+              new ByteArrayInputStream("tarball".getBytes(StandardCharsets.UTF_8))));
+        }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+        assertEquals(200, fixture.service.get(runtime, path, "http://local/repository/npm", headOnly).status());
+        verify(fixture.fetcher, org.mockito.Mockito.times(2)).fetchWithBodyRetry(any(), anyString(), any());
+      }
+    }
+  }
+
+  @Test
+  void tarballValidatorsAreBoundToTheExactPersistedSourceUrl() throws Exception {
+    String original = "https://registry.npmjs.org/download/" + TARBALL + "?token=old";
+    for (String selected : List.of(original, original.replace("old", "new"), original.replace("download/", "other/"))) {
+      Fixture fixture = fixture();
+      var runtime = runtime(1, 7L);
+      when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+          "1.0.0", Map.of("dist", Map.of("tarball", selected))))));
+      when(fixture.cache.find(eq(10L), eq(TARBALL_PATH), any())).thenReturn(Optional.of(snapshot(
+          TARBALL_PATH, Instant.EPOCH, "tarball", Map.of("remoteEtag", "old-etag",
+              "remoteLastModified", Instant.EPOCH.toString(), "npmTarballSourceUrlHash", sourceHash(original)))));
+      MavenResponse cached = MavenResponse.noBody(200);
+      when(fixture.hosted.getTarball(runtime, PACKAGE, TARBALL, true)).thenReturn(cached);
+      doAnswer(invocation -> {
+        HttpRemoteFetcher.Request request = invocation.getArgument(0);
+        assertEquals(selected, request.url());
+        assertEquals(selected.equals(original) ? "old-etag" : null, request.etag());
+        assertEquals(selected.equals(original) ? Instant.EPOCH : null, request.lastModified());
+        HttpRemoteFetcher.ResultHandler<?> handler = invocation.getArgument(2);
+        return handler.handle(new HttpRemoteFetcher.Result(304, Map.of(), InputStream.nullInputStream()));
+      }).when(fixture.fetcher).fetchWithBodyRetry(any(), anyString(), any());
+      if (selected.equals(original)) {
+        assertSame(cached, fixture.service.getTarball(runtime, PACKAGE, TARBALL, true));
+      } else {
+        assertThrows(NpmExceptions.BadUpstreamException.class,
+            () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, true));
+        verify(fixture.hosted, never()).getTarball(runtime, PACKAGE, TARBALL, true);
+      }
+    }
+  }
+
+  private static String sourceHash(String url) {
+    return java.util.HexFormat.of().formatHex(
+        com.github.klboke.kkrepo.persistence.jdbc.api.PersistenceHashes.sha256(url));
+  }
+
+  @Test
+  void resolvesRelativeTarballAndIgnoresUnrelatedOrIncompleteVersionMetadata() throws Exception {
+    var runtime = org.mockito.Mockito.spy(runtime(60, 7L));
+    when(runtime.proxyRemoteUrl()).thenReturn("https://registry.npmjs.org/artgalaxy/repo");
+    for (boolean matching : List.of(false, true)) {
+      Fixture fixture = fixture();
+      Map<String, Object> versions = new LinkedHashMap<>();
+      versions.put("invalid", "not-an-object");
+      versions.put("missing-dist", Map.of("name", "demo"));
+      versions.put("missing-url", Map.of("dist", Map.of("shasum", "abc")));
+      versions.put("another", Map.of("dist", Map.of("tarball", "other-2.0.0.tgz")));
+      if (matching) versions.put("1.0.0", Map.of("dist", Map.of("tarball", "downloads/demo-1.0.0.tgz?download=1")));
+      when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", versions)));
+      respond(fixture.fetcher, new HttpRemoteFetcher.Result(404, Map.of(), InputStream.nullInputStream()));
+      assertThrows(NpmExceptions.NpmNotFoundException.class,
+          () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, false));
+      var request = ArgumentCaptor.forClass(HttpRemoteFetcher.Request.class);
+      verify(fixture.fetcher).fetchWithBodyRetry(request.capture(), eq(TARBALL_PATH), any());
+      assertEquals("https://registry.npmjs.org/artgalaxy/repo/" +
+          (matching ? "downloads/demo-1.0.0.tgz?download=1" : TARBALL_PATH), request.getValue().url());
+    }
+  }
+
+  @Test
+  void declaredTarballUsesExistingCredentialAndUpgradePolicy() throws Exception {
+    for (String remote : List.of("https://registry.npmjs.org/", "http://registry.npmjs.org/")) {
+      var runtime = org.mockito.Mockito.spy(runtime(60, 7L));
+      when(runtime.proxyRemoteUrl()).thenReturn(remote);
+      when(runtime.proxyRemoteUsername()).thenReturn("robot");
+      when(runtime.proxyRemotePassword()).thenReturn("secret");
+      Fixture fixture = fixture();
+      when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+          "1.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/artgalaxy/demo-1.0.0.tgz"))))));
+      respond(fixture.fetcher, new HttpRemoteFetcher.Result(404, Map.of(), InputStream.nullInputStream()));
+      assertThrows(NpmExceptions.NpmNotFoundException.class,
+          () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, true));
+      var request = ArgumentCaptor.forClass(HttpRemoteFetcher.Request.class);
+      verify(fixture.fetcher).fetchWithBodyRetry(request.capture(), eq(TARBALL_PATH), any());
+      assertEquals("Basic cm9ib3Q6c2VjcmV0", request.getValue().authorizationHeader());
+    }
+    var runtime = org.mockito.Mockito.spy(runtime(60, 7L));
+    when(runtime.allowsRedirectHost("cdn.example.org")).thenReturn(true);
+    when(runtime.proxyRemoteBearerToken()).thenReturn("secret-token");
+    Fixture fixture = fixture();
+    when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+        "1.0.0", Map.of("dist", Map.of("tarball", "https://cdn.example.org/demo-1.0.0.tgz"))))));
+    respond(fixture.fetcher, new HttpRemoteFetcher.Result(404, Map.of(), InputStream.nullInputStream()));
+    assertThrows(NpmExceptions.NpmNotFoundException.class,
+        () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, false));
+    var request = ArgumentCaptor.forClass(HttpRemoteFetcher.Request.class);
+    verify(fixture.fetcher).fetchWithBodyRetry(request.capture(), eq(TARBALL_PATH), any());
+    assertNull(request.getValue().authorizationHeader());
+    assertEquals("cdn.example.org", request.getValue().trustedHost());
+  }
+
+  @Test
+  void tarballDoesNotAliasUnadvertisedDirectoriesToADeclaredDownload() throws Exception {
+    Fixture fixture = fixture();
+    var runtime = runtime(60, 7L);
+    when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+        "1.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/demo/-/signed/demo.tgz"))))));
+    assertThrows(NpmExceptions.NpmNotFoundException.class,
+        () -> fixture.service.getTarball(runtime, PACKAGE, "attacker/demo.tgz", false));
+    verify(fixture.fetcher, never()).fetchWithBodyRetry(any(), anyString(), any());
+    org.mockito.Mockito.verifyNoInteractions(fixture.writer);
+  }
+
+  @Test
+  void tarballRejectsUntrustedOrAmbiguousPackumentDestinationsBeforeFetching() throws Exception {
+    var runtime = runtime(60, 7L);
+    for (String url : List.of("https://other.example/demo-1.0.0.tgz", "http://registry.npmjs.org/demo-1.0.0.tgz",
+        "https://registry.npmjs.org:8443/demo-1.0.0.tgz", "file:///demo-1.0.0.tgz",
+        "https://user:secret@registry.npmjs.org/demo-1.0.0.tgz")) {
+      Fixture fixture = fixture();
+      when(fixture.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+          "1.0.0", Map.of("dist", Map.of("tarball", url))))));
+      assertThrows(NpmExceptions.BadUpstreamException.class,
+          () -> fixture.service.getTarball(runtime, PACKAGE, TARBALL, false));
+      verify(fixture.fetcher, never()).fetchWithBodyRetry(any(), anyString(), any());
+    }
+    Fixture ambiguous = fixture();
+    when(ambiguous.hosted.packageRoot(runtime, PACKAGE)).thenReturn(Optional.of(Map.of("versions", Map.of(
+        "1.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/a/demo-1.0.0.tgz")),
+        "2.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/b/demo-1.0.0.tgz"))))));
+    assertThrows(NpmExceptions.BadUpstreamException.class,
+        () -> ambiguous.service.getTarball(runtime, PACKAGE, TARBALL, false));
+    verify(ambiguous.fetcher, never()).fetchWithBodyRetry(any(), anyString(), any());
   }
 
   @Test
@@ -729,6 +1054,82 @@ class NpmProxyRuntimeTest {
   }
 
   @Test
+  void cachedNewScopedTarballCannotBorrowAnOldUnscopedVersionsReleaseAge() throws Exception {
+    Instant now = Instant.parse("2026-07-19T12:00:00Z");
+    Fixture fixture = fixtureWithoutReleaseIndex(Clock.fixed(now, ZoneOffset.UTC));
+    var pkg = NpmPackageId.parse("@abc/demo");
+    var runtime = runtime(60, 7L, 60);
+    var metadata = snapshot(pkg.id(), now, "package-root", Map.of("npmFullMetadata", "true"));
+    var tarball = snapshot(pkg.tarballPath("@abc/pkg.tgz"), now, "tarball", Map.of());
+    when(fixture.cache.find(eq(10L), anyString(), any())).thenAnswer(invocation ->
+        Optional.of(pkg.id().equals(invocation.getArgument(1)) ? metadata : tarball));
+    Map<String, Object> root = Map.of("versions", Map.of(
+        "1.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/pkg.tgz")),
+        "2.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/@abc%2Fpkg.tgz"))),
+        "time", Map.of("1.0.0", now.minusSeconds(7200).toString(), "2.0.0", now.minusSeconds(10).toString()));
+    when(fixture.hosted.packageRoot(metadata)).thenReturn(Optional.of(root));
+    assertThrows(NpmExceptions.ReleaseAgeDenied.class,
+        () -> fixture.service.getTarball(runtime, pkg, "@abc/pkg.tgz", false));
+    MavenResponse old = MavenResponse.noBody(200);
+    when(fixture.hosted.getTarball(runtime, pkg, "pkg.tgz", false)).thenReturn(old);
+    assertSame(old, fixture.service.getTarball(runtime, pkg, "pkg.tgz", false));
+    verify(fixture.hosted, never()).getTarball(runtime, pkg, "@abc/pkg.tgz", false);
+  }
+
+  @Test
+  void scopedLockfileUsesCanonicalPolicyLookupAndRebuildsLegacyIndex() throws Exception {
+    Instant now = Instant.parse("2026-07-19T12:00:00Z");
+    var pkg = NpmPackageId.parse("@abc/abc-ui");
+    String name = "@abc/abc-ui-1.0.0.tgz";
+    String canonical = "@abc/abc-ui-1.0.0.tgz";
+    var runtime = runtime(60, 7L, 60);
+    for (boolean legacy : List.of(false, true)) {
+      Fixture fixture = fixture(Clock.fixed(now, ZoneOffset.UTC));
+      var metadata = snapshot(pkg.id(), now, "package-root", Map.of("npmFullMetadata", "true"));
+      var tarball = snapshot(pkg.tarballPath(name), now, "tarball", Map.of());
+      when(fixture.cache.find(eq(10L), anyString(), any())).thenAnswer(invocation ->
+          Optional.of(pkg.id().equals(invocation.getArgument(1)) ? metadata : tarball));
+      var status = new NpmReleaseIndexDao.Status(1L, 2L, true, 1, now);
+      var release = new NpmReleaseIndexDao.Release(0, "1.0.0", now.minusSeconds(7200), null, canonical);
+      var policy = new NpmReleaseIndexDao.TarballPolicy(status, false, List.of(release));
+      when(fixture.releaseIndexDao.findTarballPolicy(1L, 2L, canonical, null, null))
+          .thenReturn(legacy ? Optional.empty() : Optional.of(policy), Optional.of(policy));
+      when(fixture.hosted.packageRoot(metadata)).thenReturn(Optional.of(Map.of(
+          "versions", Map.of("1.0.0", Map.of("dist", Map.of("tarball", "https://registry.npmjs.org/@abc%2Fabc-ui-1.0.0.tgz"))),
+          "time", Map.of("1.0.0", now.minusSeconds(7200).toString()))));
+      when(fixture.releaseIndexDao.findSnapshot(1L, 2L))
+          .thenReturn(Optional.of(new NpmReleaseIndexDao.Snapshot(status, List.of(release))));
+      MavenResponse expected = MavenResponse.noBody(200);
+      when(fixture.hosted.getTarball(runtime, pkg, name, false)).thenReturn(expected);
+      assertSame(expected, fixture.service.getTarball(runtime, pkg, name, false));
+      verify(fixture.releaseIndexDao, org.mockito.Mockito.times(legacy ? 2 : 1))
+          .findTarballPolicy(1L, 2L, canonical, null, null);
+      verify(fixture.hosted, org.mockito.Mockito.times(legacy ? 1 : 0)).packageRoot(any(CachedAssetMetadata.class));
+      verify(fixture.fetcher, never()).fetchWithBodyRetry(any(), anyString(), any());
+    }
+  }
+
+  @Test
+  void unscopedLegacyLockfileResolvesUniqueNestedReleaseIndexIdentity() throws Exception {
+    Instant now = Instant.parse("2026-07-19T12:00:00Z");
+    Fixture fixture = fixture(Clock.fixed(now, ZoneOffset.UTC));
+    var runtime = runtime(60, 7L, 60);
+    var metadata = snapshot(PACKAGE.id(), now, "package-root", Map.of("npmFullMetadata", "true"));
+    var tarball = snapshot(TARBALL_PATH, now, "tarball", Map.of());
+    when(fixture.cache.find(eq(10L), anyString(), any())).thenAnswer(invocation ->
+        Optional.of(PACKAGE.id().equals(invocation.getArgument(1)) ? metadata : tarball));
+    var status = new NpmReleaseIndexDao.Status(1L, 2L, true, 1, now);
+    when(fixture.releaseIndexDao.findTarballPolicy(1L, 2L, TARBALL, null, null))
+        .thenReturn(Optional.of(new NpmReleaseIndexDao.TarballPolicy(status, false, List.of())));
+    when(fixture.releaseIndexDao.findSnapshot(1L, 2L)).thenReturn(Optional.of(new NpmReleaseIndexDao.Snapshot(
+        status, List.of(new NpmReleaseIndexDao.Release(0, "1.0.0", now.minusSeconds(7200), null, "signed/" + TARBALL)))));
+    MavenResponse expected = MavenResponse.noBody(200);
+    when(fixture.hosted.getTarball(runtime, PACKAGE, TARBALL, false)).thenReturn(expected);
+    assertSame(expected, fixture.service.getTarball(runtime, PACKAGE, TARBALL, false));
+    verify(fixture.fetcher, never()).fetchWithBodyRetry(any(), anyString(), any());
+  }
+
+  @Test
   void indexedSnapshotAvoidsRebuildingAnalysisButStillWritesPackumentBody() throws Exception {
     Instant now = Instant.parse("2026-07-19T12:00:00Z");
     Fixture fixture = fixture(Clock.fixed(now, ZoneOffset.UTC));
@@ -857,6 +1258,8 @@ class NpmProxyRuntimeTest {
     NpmHostedService hosted = mock(NpmHostedService.class);
     ProxyNegativeCache negativeCache = mock(ProxyNegativeCache.class);
     AssetMetadataCache cache = mock(AssetMetadataCache.class);
+    when(cache.find(eq(10L), org.mockito.ArgumentMatchers.argThat(path -> path != null && !path.contains("/-/")), any()))
+        .thenAnswer(invocation -> Optional.of(snapshot(invocation.getArgument(1), clock.instant(), "package-root", Map.of())));
     NpmReleaseIndexDao releaseIndexDao = releaseIndexEnabled
         ? mock(NpmReleaseIndexDao.class)
         : null;

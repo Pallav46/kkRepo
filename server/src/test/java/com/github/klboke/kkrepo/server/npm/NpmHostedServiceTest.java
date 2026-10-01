@@ -79,7 +79,7 @@ class NpmHostedServiceTest {
         {
           "name":"demo",
           "versions":{"1.0.0":{"name":"demo","version":"1.0.0",
-            "dist":{"tarball":"demo-1.0.0.tgz"}}},
+            "dist":{"tarball":"https://upstream/download/-/signed%%2Fdemo-1.0.0.tgz"}}},
           "dist-tags":{"latest":"1.0.0"},
           "_attachments":{"demo-1.0.0.tgz":{"data":"%s","content_type":"application/octet-stream"}}
         }
@@ -102,6 +102,7 @@ class NpmHostedServiceTest {
     Map<String, Object> stored = fixture.mapper.readValue(json.getValue(), MAP);
     assertNotNull(stored.get("_rev"));
     assertEquals(null, stored.get("_attachments"));
+    assertEquals("demo-1.0.0.tgz", map(map(map(stored.get("versions")).get("1.0.0")).get("dist")).get("tarball"));
   }
 
   @Test
@@ -473,7 +474,7 @@ class NpmHostedServiceTest {
     String json = """
         {"name":"demo","dist-tags":{"latest":"1.0.0"},"versions":{
           "1.0.0":{"name":"demo","version":"1.0.0",
-            "dist":{"tarball":"https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}}
+            "dist":{"tarball":"https://registry.npmjs.org/demo/-/signed/demo-1.0.0.tgz"}}
         }}
         """;
     CachedAssetMetadata snapshot = packageSnapshot(json);
@@ -486,10 +487,10 @@ class NpmHostedServiceTest {
     when(fixture.cache.find(eq(10L), eq("demo"), any()))
         .thenReturn(Optional.of(snapshot));
     String served = new String(fixture.service.getPackage(
-        runtime("ALLOW", 7L), PACKAGE, "https://packages.example/npm", false)
+        runtime("ALLOW", 7L), PACKAGE, "https://packages.example/edge/-/prod/repository/npm", false)
         .body().readAllBytes(), StandardCharsets.UTF_8);
     assertEquals(true, served.contains(
-        "https://packages.example/npm/demo/-/demo-1.0.0.tgz"));
+        "https://packages.example/edge/-/prod/repository/npm/demo/-/demo-1.0.0.tgz"));
     verify(fixture.downloadPolicy).beforeReadFromRepository(
         snapshot.assetId(), snapshot.blob().id(), snapshot.repositoryId());
   }

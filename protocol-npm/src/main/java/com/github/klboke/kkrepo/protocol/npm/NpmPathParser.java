@@ -1,7 +1,5 @@
 package com.github.klboke.kkrepo.protocol.npm;
 
-import java.util.Arrays;
-
 public final class NpmPathParser {
   public NpmPath parse(String rawPath) {
     String raw = rawPath == null ? "" : rawPath;
@@ -13,6 +11,10 @@ public final class NpmPathParser {
       return simple(NpmPath.Kind.UNKNOWN, raw);
     }
     while (decoded.startsWith("/")) decoded = decoded.substring(1);
+    // Empty tarball segments are URL data; never collapse them into another asset identity.
+    if (decoded.contains("/-/") && (decoded.contains("//") || decoded.endsWith("/"))) {
+      return simple(NpmPath.Kind.UNKNOWN, raw);
+    }
     while (decoded.endsWith("/") && decoded.length() > 1) {
       decoded = decoded.substring(0, decoded.length() - 1);
     }
@@ -74,9 +76,7 @@ public final class NpmPathParser {
     if (decoded.isBlank()) {
       return simple(NpmPath.Kind.REPOSITORY_ROOT, raw);
     }
-    String[] parts = Arrays.stream(decoded.split("/"))
-        .filter(s -> !s.isEmpty())
-        .toArray(String[]::new);
+    String[] parts = decoded.split("/", -1);
     if (parts.length == 0) {
       return simple(NpmPath.Kind.UNKNOWN, raw);
     }
@@ -100,13 +100,20 @@ public final class NpmPathParser {
       return new NpmPath(NpmPath.Kind.PACKAGE_ROOT, raw, packageId, null, null, null, parts[index + 1]);
     }
     if (parts[index].equals("-") && parts.length >= index + 2) {
-      String tarballName = parts[index + 1];
+      int end = parts.length;
       String revision = null;
-      if (parts.length == index + 4 && parts[index + 2].equals("-rev")) {
-        revision = parts[index + 3];
-      } else if (parts.length != index + 2) {
-        return simple(NpmPath.Kind.UNKNOWN, raw);
+      if (end >= index + 4 && parts[end - 2].equals("-rev")) {
+        revision = parts[end - 1];
+        end -= 2;
       }
+      // Everything after /-/ is a tarball path, including @-prefixed directories.
+      // The package identity comes only from the prefix; keep the full suffix distinct.
+      for (int i = index + 1; i < parts.length; i++) {
+        if (parts[i].isEmpty() || parts[i].equals(".") || parts[i].equals("..")) {
+          return simple(NpmPath.Kind.UNKNOWN, raw);
+        }
+      }
+      String tarballName = String.join("/", java.util.Arrays.copyOfRange(parts, index + 1, end));
       return new NpmPath(NpmPath.Kind.TARBALL, raw, packageId, null, tarballName, null, revision);
     }
     if (parts.length == index + 1) {

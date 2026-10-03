@@ -295,6 +295,32 @@ class SecurityAuthenticationServiceTest {
   }
 
   @Test
+  void freshAuthenticationObservesRevocationEvenWithWarmCredentialCaches() {
+    FakeSecurityDao dao = new FakeSecurityDao();
+    dao.realm(new SecurityRealmRecord(1L, "local", "LOCAL", "Local", true, 0, Map.of("source", "Local")));
+    dao.user(user(1L, "Local", "ci-bot", NEXUS_SHIRO1_ADMIN123));
+    dao.apiKey(new ApiKeyRecord(20L, "GenericToken", "Local", "ci-bot", "CI", "ACTIVE",
+        SecurityHashing.sha256("generic-secret"), "GenericToken", Map.of(), "{}",
+        null, null, LocalDateTime.now().plusDays(1), null));
+    var cache = new com.github.klboke.kkrepo.server.support.InMemorySharedCache();
+    SecurityAuthenticationService service = new SecurityAuthenticationService(dao, OBJECT_MAPPER,
+        "X-Nexus-Plus-Token", "nx-anonymous", cache, OutboundRequestPolicy.allowPrivateForTests(),
+        transportFactory, new ApiKeyAuthCache(cache, true, 60, 5),
+        new BasicAuthCache(cache, true, 60, 5), null);
+    var token = request(Map.of("Authorization", "Bearer GenericToken.generic-secret"));
+    var password = request(Map.of("Authorization", basic("ci-bot", "admin123")));
+    assertTrue(service.authenticate(token).isPresent());
+    assertTrue(service.authenticate(password).isPresent());
+    dao.deleteApiKeysForOwner("Local", "ci-bot");
+    dao.user(user(1L, "Local", "ci-bot", SecurityHashing.hashPassword("replacement")));
+    // Another pod has not received cache invalidation yet.
+    assertTrue(service.authenticate(token).isPresent());
+    assertTrue(service.authenticate(password).isPresent());
+    assertTrue(service.authenticateFresh(token).isEmpty());
+    assertTrue(service.authenticateFresh(password).isEmpty());
+  }
+
+  @Test
   void authenticatesGenericTokenWithDomainPrefixedBearerToken() {
     FakeSecurityDao dao = new FakeSecurityDao();
     dao.user(user(1L, "Local", "ci-bot", NEXUS_SHIRO1_ADMIN123));
@@ -962,6 +988,32 @@ class SecurityAuthenticationServiceTest {
     assertEquals("anonymous", authenticated.get().userId());
     assertEquals("NexusAuthorizingRealm", authenticated.get().realmId());
     assertTrue(authenticated.get().permissionSubject().groupIds().contains("nx-anonymous"));
+  }
+
+  @Test
+  void freshAnonymousReadsObserveDisabledAccessAndRoleRevocationDespiteAWarmCatalog() {
+    FakeSecurityDao dao = new FakeSecurityDao();
+    var enabled = new SecurityAnonymousConfigRecord(true, "Local", "anonymous", "NexusAuthorizingRealm");
+    var user = user(3L, "Local", "anonymous", null);
+    dao.anonymous(enabled);
+    dao.user(user);
+    dao.roles(3L, "nx-anonymous");
+    var catalog = mock(SecurityCatalogCache.SecurityCatalog.class);
+    org.mockito.Mockito.when(catalog.anonymousConfig()).thenReturn(enabled);
+    org.mockito.Mockito.when(catalog.anonymousUser()).thenReturn(user);
+    org.mockito.Mockito.when(catalog.userRoleIds("Local", "anonymous")).thenReturn(List.of("nx-anonymous"));
+    var cache = mock(SecurityCatalogCache.class);
+    org.mockito.Mockito.when(cache.current()).thenReturn(Optional.of(catalog));
+    var service = new SecurityAuthenticationService(dao, OBJECT_MAPPER,
+        "X-Nexus-Plus-Token", "nx-anonymous", cache);
+    assertTrue(service.authenticateAnonymous().isPresent());
+    assertTrue(service.authenticateAnonymousFresh().isPresent());
+    dao.anonymous(new SecurityAnonymousConfigRecord(false, "Local", "anonymous", "NexusAuthorizingRealm"));
+    assertTrue(service.authenticateAnonymous().isPresent(), "Cached replica still has its previous public settings");
+    assertTrue(service.authenticateAnonymousFresh().isEmpty());
+    dao.anonymous(enabled);
+    dao.roles(3L);
+    assertFalse(service.authenticateAnonymousFresh().orElseThrow().permissionSubject().groupIds().contains("nx-anonymous"));
   }
 
   @Test

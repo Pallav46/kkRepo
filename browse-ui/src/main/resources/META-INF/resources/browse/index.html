@@ -8,7 +8,7 @@
     <link id="kkrepo-theme-stylesheet" rel="stylesheet" href="/browse/assets/themes/default.css?v=20260826-nexus-a11y-1">
     <script src="/login/assets/ui-theme.js?v=20260826-nexus-a11y-1"></script>
   <link rel="stylesheet" href="/browse/assets/ui-scrollbars.css?v=20260826-shared-scrollbars-4">
-    <link rel="stylesheet" href="/browse/assets/format-icons.css?v=20260811-conan-1">
+    <link rel="stylesheet" href="/browse/assets/format-icons.css?v=20261003-gitlfs-1">
     <link rel="stylesheet" href="/browse/assets/lucide-icons.css?v=20260818-user-round-1">
     <link rel="stylesheet" href="/browse/assets/browse.css?v=20260826-nexus-a11y-1">
     <link rel="stylesheet" href="/browse/assets/account-menu.css?v=20260824-ui-themes-3">
@@ -152,7 +152,7 @@
                 <h2 id="supported-formats-title">Supported repository formats</h2>
                 <p>Package ecosystems supported by this kkRepo release.</p>
               </div>
-              <span class="format-showcase-count">22 formats</span>
+              <span class="format-showcase-count">23 formats</span>
             </div>
             <ul class="format-grid">
               <li class="format-item" data-format="maven2">
@@ -302,6 +302,13 @@
                 </div>
                 <span class="format-modes">Hosted · Proxy · Group</span>
               </li>
+              <li class="format-item" data-format="gitlfs">
+                <div class="format-brand">
+                  <span class="format-logo format-logo-gitlfs" aria-hidden="true"></span>
+                  <strong>Git LFS</strong>
+                </div>
+                <span class="format-modes">Hosted</span>
+              </li>
               <li class="format-item" data-format="huggingface">
                 <div class="format-brand">
                   <span class="format-logo format-logo-huggingface" aria-hidden="true"></span>
@@ -390,6 +397,7 @@
                 <option value="alpine">Alpine / APK</option>
                 <option value="r">R / CRAN</option>
                 <option value="huggingface">Hugging Face Models</option>
+                <option value="gitlfs">Git LFS</option>
                 <option value="raw">Raw</option>
                 </select>
                 <button
@@ -443,6 +451,7 @@
                     <button class="search-format-option" id="component-custom-format-option-apt" type="button" role="option" aria-selected="false" data-custom-search-format="apt"><span class="format-logo format-logo-apt" aria-hidden="true"></span><span>APT / Debian</span></button>
                     <button class="search-format-option" id="component-custom-format-option-alpine" type="button" role="option" aria-selected="false" data-custom-search-format="alpine"><span class="format-logo format-logo-alpine" aria-hidden="true"></span><span>Alpine / APK</span></button>
                     <button class="search-format-option" id="component-custom-format-option-r" type="button" role="option" aria-selected="false" data-custom-search-format="r"><span class="format-logo format-logo-r" aria-hidden="true"></span><span>R / CRAN</span></button>
+                    <button class="search-format-option" id="component-custom-format-option-gitlfs" type="button" role="option" aria-selected="false" data-custom-search-format="gitlfs"><span class="format-logo format-logo-gitlfs" aria-hidden="true"></span><span>Git LFS</span></button>
                     <button class="search-format-option" id="component-custom-format-option-huggingface" type="button" role="option" aria-selected="false" data-custom-search-format="huggingface"><span class="format-logo format-logo-huggingface" aria-hidden="true"></span><span>Hugging Face Models</span></button>
                     <button class="search-format-option" id="component-custom-format-option-raw" type="button" role="option" aria-selected="false" data-custom-search-format="raw"><span class="format-logo format-logo-raw" aria-hidden="true"></span><span>Raw</span></button>
                   </div>
@@ -561,6 +570,6 @@
     <script src="/login/assets/product-update.js?v=20260819-version-update-1"></script>
     <script src="/login/assets/login-modal.js?v=20260818-login-icons-3"></script>
     <script src="/browse/assets/global-component-search.js?v=20260826-search-menu-3"></script>
-    <script src="/browse/assets/browse.js?v=20260908-content-selectors-1"></script>
+    <script src="/browse/assets/browse.js?v=20261003-gitlfs-1"></script>
   </body>
 </html>

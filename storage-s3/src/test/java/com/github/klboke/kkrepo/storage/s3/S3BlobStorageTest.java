@@ -55,6 +55,66 @@ class S3BlobStorageTest {
   Path tempDir;
 
   @Test
+  void verifiedStreamingValidatesBeforeCompletionAndAbortsInvalidContent() throws Exception {
+    S3Client client = mock(S3Client.class);
+    when(client.createMultipartUpload(any(CreateMultipartUploadRequest.class)))
+        .thenReturn(CreateMultipartUploadResponse.builder().uploadId("durable-handle").build());
+    when(client.uploadPart(any(UploadPartRequest.class), any(RequestBody.class)))
+        .thenReturn(UploadPartResponse.builder().eTag("part").build());
+    S3BlobStorage storage = new S3BlobStorage(client, config(1));
+    byte[] bytes = new byte[com.github.klboke.kkrepo.core.VerifiedBlobReader.PART_BYTES + 1];
+    String sha = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+    var target = storage.prepareVerifiedUpload("lfs", sha, bytes.length);
+    var order = org.mockito.Mockito.inOrder(client);
+    var result = storage.uploadVerified(target, new ByteArrayInputStream(bytes), id -> {
+      assertEquals("durable-handle", id);
+      verify(client, never()).uploadPart(any(UploadPartRequest.class), any(RequestBody.class));
+    });
+    assertEquals(sha, result.sha256());
+    order.verify(client).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+    order.verify(client, org.mockito.Mockito.times(2)).uploadPart(any(UploadPartRequest.class), any(RequestBody.class));
+    order.verify(client).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+    assertFalse(target.objectKey().equals(storage.prepareVerifiedUpload("lfs", sha, bytes.length).objectKey()));
+    org.mockito.Mockito.clearInvocations(client);
+    var invalid = storage.prepareVerifiedUpload("lfs", "f".repeat(64), bytes.length);
+    assertThrows(com.github.klboke.kkrepo.core.BlobIntegrityException.class,
+        () -> storage.uploadVerified(invalid, new ByteArrayInputStream(bytes), id -> {}));
+    verify(client, never()).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+    verify(client).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    storage.close();
+  }
+
+  @Test
+  void verifiedEmptyObjectsAndCrashRecoveryNeverDeleteAnotherAttempt() {
+    S3Client client = mock(S3Client.class);
+    var storage = new S3BlobStorage(client, config(1));
+    var target = storage.prepareVerifiedUpload("lfs",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0);
+    assertEquals(0, storage.uploadVerified(target, InputStream.nullInputStream(), id -> org.junit.jupiter.api.Assertions.fail()).size());
+    verify(client).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+    verify(client, never()).createMultipartUpload(any(CreateMultipartUploadRequest.class));
+    when(client.listMultipartUploads(any(software.amazon.awssdk.services.s3.model.ListMultipartUploadsRequest.class)))
+        .thenReturn(software.amazon.awssdk.services.s3.model.ListMultipartUploadsResponse.builder().uploads(
+            software.amazon.awssdk.services.s3.model.MultipartUpload.builder().key(target.objectKey()).uploadId("lost-handle").build(),
+            software.amazon.awssdk.services.s3.model.MultipartUpload.builder().key(target.objectKey() + "-other").uploadId("other").build()).build());
+    storage.discardVerifiedUpload(target, null);
+    var aborted = ArgumentCaptor.forClass(AbortMultipartUploadRequest.class);
+    verify(client).abortMultipartUpload(aborted.capture());
+    assertEquals("lost-handle", aborted.getValue().uploadId());
+    assertEquals(target.objectKey(), aborted.getValue().key());
+    var deleted = ArgumentCaptor.forClass(DeleteObjectRequest.class);
+    verify(client).deleteObject(deleted.capture());
+    assertEquals(target.objectKey(), deleted.getValue().key());
+    org.mockito.Mockito.doThrow(S3Exception.builder().statusCode(404).build())
+        .when(client).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    storage.discardVerifiedUpload(target, "already-completed");
+    org.mockito.Mockito.doThrow(S3Exception.builder().statusCode(503).build())
+        .when(client).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    assertThrows(S3Exception.class, () -> storage.discardVerifiedUpload(target, "retry-later"));
+    storage.close();
+  }
+
+  @Test
   void putUploadsReplayableAndOneShotStreamsWithSanitizedMetadata() throws Exception {
     S3Client client = mock(S3Client.class);
     List<byte[]> uploaded = new ArrayList<>();

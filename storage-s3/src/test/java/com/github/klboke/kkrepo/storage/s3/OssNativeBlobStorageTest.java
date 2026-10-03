@@ -46,6 +46,74 @@ class OssNativeBlobStorageTest {
   Path tempDir;
 
   @Test
+  void verifiedStreamingChecksOidBeforeCompleteAndPersistsHandleBeforeParts() throws Exception {
+    OSSClient client = mock(OSSClient.class);
+    var initiated = mock(InitiateMultipartUploadResult.class);
+    var handle = mock(InitiateMultipartUpload.class);
+    when(handle.uploadId()).thenReturn("durable-handle");
+    when(initiated.initiateMultipartUpload()).thenReturn(handle);
+    when(client.initiateMultipartUpload(any(InitiateMultipartUploadRequest.class))).thenReturn(initiated);
+    var partResult = mock(UploadPartResult.class);
+    when(partResult.eTag()).thenReturn("part");
+    when(client.uploadPart(any(UploadPartRequest.class))).thenReturn(partResult);
+    OssNativeBlobStorage storage = new OssNativeBlobStorage(client, config(1));
+    byte[] bytes = new byte[com.github.klboke.kkrepo.core.VerifiedBlobReader.PART_BYTES + 1];
+    String sha = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+    var target = storage.prepareVerifiedUpload("lfs", sha, bytes.length);
+    var result = storage.uploadVerified(target, new ByteArrayInputStream(bytes), id -> {
+      assertEquals("durable-handle", id);
+      verify(client, never()).uploadPart(any(UploadPartRequest.class));
+    });
+    assertEquals(sha, result.sha256());
+    assertFalse(target.objectKey().equals(storage.prepareVerifiedUpload("lfs", sha, bytes.length).objectKey()));
+    verify(client, org.mockito.Mockito.times(2)).uploadPart(any(UploadPartRequest.class));
+    verify(client).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+    org.mockito.Mockito.clearInvocations(client);
+    var invalid = storage.prepareVerifiedUpload("lfs", "f".repeat(64), bytes.length);
+    assertThrows(com.github.klboke.kkrepo.core.BlobIntegrityException.class,
+        () -> storage.uploadVerified(invalid, new ByteArrayInputStream(bytes), id -> {}));
+    verify(client, never()).completeMultipartUpload(any(CompleteMultipartUploadRequest.class));
+    verify(client).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    storage.close();
+  }
+
+  @Test
+  void verifiedEmptyObjectsAndCrashRecoveryUseExactAttemptKeys() {
+    OSSClient client = mock(OSSClient.class);
+    var storage = new OssNativeBlobStorage(client, config(1));
+    var target = storage.prepareVerifiedUpload("lfs",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0);
+    assertEquals(0, storage.uploadVerified(target, InputStream.nullInputStream(), id -> org.junit.jupiter.api.Assertions.fail()).size());
+    verify(client).putObject(any(PutObjectRequest.class));
+    verify(client, never()).initiateMultipartUpload(any(InitiateMultipartUploadRequest.class));
+    var result = mock(com.aliyun.sdk.service.oss2.models.ListMultipartUploadsResult.class);
+    var lost = mock(com.aliyun.sdk.service.oss2.models.Upload.class);
+    var other = mock(com.aliyun.sdk.service.oss2.models.Upload.class);
+    when(lost.key()).thenReturn(target.objectKey());
+    when(lost.uploadId()).thenReturn("lost-handle");
+    when(other.key()).thenReturn(target.objectKey() + "-other");
+    when(result.uploads()).thenReturn(List.of(lost, other));
+    when(client.listMultipartUploads(any(com.aliyun.sdk.service.oss2.models.ListMultipartUploadsRequest.class))).thenReturn(result);
+    storage.discardVerifiedUpload(target, null);
+    var aborted = ArgumentCaptor.forClass(AbortMultipartUploadRequest.class);
+    verify(client).abortMultipartUpload(aborted.capture());
+    assertEquals("lost-handle", aborted.getValue().uploadId());
+    assertEquals(target.objectKey(), aborted.getValue().key());
+    var deleted = ArgumentCaptor.forClass(com.aliyun.sdk.service.oss2.models.DeleteObjectRequest.class);
+    verify(client).deleteObject(deleted.capture());
+    assertEquals(target.objectKey(), deleted.getValue().key());
+    var missing = mock(ServiceException.class);
+    when(missing.statusCode()).thenReturn(404);
+    org.mockito.Mockito.doThrow(missing).when(client).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    storage.discardVerifiedUpload(target, "already-completed");
+    var retry = mock(ServiceException.class);
+    when(retry.statusCode()).thenReturn(503);
+    org.mockito.Mockito.doThrow(retry).when(client).abortMultipartUpload(any(AbortMultipartUploadRequest.class));
+    assertThrows(ServiceException.class, () -> storage.discardVerifiedUpload(target, "retry-later"));
+    storage.close();
+  }
+
+  @Test
   void putOmitsBlankMetadataAndUploadsOriginalBytes() {
     OSSClient client = mock(OSSClient.class);
     OssNativeBlobStorage storage = new OssNativeBlobStorage(client, config(64 * 1024 * 1024L));

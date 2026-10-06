@@ -564,10 +564,20 @@ function hasRepositoryUploadPermission() {
   });
 }
 
-function canUseUpload() {
-  if (!currentSession || !hasUploadPermission()) return false;
-  if (!uploadRepositoriesLoaded) return true;
-  return uploadableRepositories(uploadRepositoriesCache).length > 0;
+// The Upload entry is offered to signed-in users that hold an add/create permission. Whether
+// any repository can actually take a web upload is explained on the page itself instead of
+// silently redirecting away from it.
+function canShowUploadNav() {
+  return Boolean(currentSession && hasUploadPermission());
+}
+
+function uploadEmptyStateMessage(hasPermission) {
+  if (!hasPermission) {
+    return "You do not have permission to upload. Ask an administrator for add access to a hosted repository.";
+  }
+  return "No repository is available for web upload. Create an online hosted repository in a format "
+    + "that supports upload (for example Raw, Maven, npm or PyPI). Docker images are pushed with "
+    + "\"docker push\" instead.";
 }
 
 function updateTopbarAuth() {
@@ -601,9 +611,8 @@ function updateTopbarAuth() {
     userMenuTrigger.setAttribute("aria-label", `Account menu for ${qualifiedUser}`);
   }
 
-  const uploadVisible = canUseUpload();
-  uploadNav.hidden = !uploadVisible;
-  if (!uploadVisible && document.getElementById("upload-view").classList.contains("is-active")) {
+  uploadNav.hidden = !canShowUploadNav();
+  if (!signedIn && document.getElementById("upload-view").classList.contains("is-active")) {
     showRepositoryList();
   }
   if (!signedIn && document.getElementById("my-token-view").classList.contains("is-active")) {
@@ -963,7 +972,7 @@ function showWelcome(syncHash = true) {
 }
 
 function showUpload(syncHash = true) {
-  if (!canUseUpload()) {
+  if (!currentSession) {
     showRepositoryList(true);
     return;
   }
@@ -3263,6 +3272,12 @@ function renderUpload() {
     select.value = uploadRepos[0].name;
   }
   renderUploadFields();
+  if (uploadRepos.length === 0) {
+    select.innerHTML = '<option value="">No repositories available</option>';
+    select.disabled = true;
+    document.getElementById("upload-fields").innerHTML =
+      `<div class="muted-row upload-empty" role="note">${escapeHtml(uploadEmptyStateMessage(hasUploadPermission()))}</div>`;
+  }
   updateUploadPath();
 }
 

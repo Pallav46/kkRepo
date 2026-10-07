@@ -564,10 +564,21 @@ function hasRepositoryUploadPermission() {
   });
 }
 
-function canUseUpload() {
-  if (!currentSession || !hasUploadPermission()) return false;
-  if (!uploadRepositoriesLoaded) return true;
-  return uploadableRepositories(uploadRepositoriesCache).length > 0;
+// The Upload entry is offered to signed-in users that hold an add/create permission. Whether
+// any repository can actually take a web upload is explained on the page itself instead of
+// silently redirecting away from it.
+function canShowUploadNav() {
+  return Boolean(currentSession && hasUploadPermission());
+}
+
+// Deliberately neutral: the Upload entry is gated on add/create permissions, while the backend
+// lists a repository as uploadable only when the account may edit it, so the page cannot tell
+// a missing repository from a missing permission and must not recommend a specific grant.
+function uploadEmptyStateMessage() {
+  return "No repository is available for web upload with your current account. Web upload needs an "
+    + "online hosted repository in a format that supports it (for example Raw, Maven, npm or PyPI) "
+    + "and permission to edit it; ask an administrator if you expect one. Docker images are pushed "
+    + "with \"docker push\" instead.";
 }
 
 function updateTopbarAuth() {
@@ -601,9 +612,8 @@ function updateTopbarAuth() {
     userMenuTrigger.setAttribute("aria-label", `Account menu for ${qualifiedUser}`);
   }
 
-  const uploadVisible = canUseUpload();
-  uploadNav.hidden = !uploadVisible;
-  if (!uploadVisible && document.getElementById("upload-view").classList.contains("is-active")) {
+  uploadNav.hidden = !canShowUploadNav();
+  if (!signedIn && document.getElementById("upload-view").classList.contains("is-active")) {
     showRepositoryList();
   }
   if (!signedIn && document.getElementById("my-token-view").classList.contains("is-active")) {
@@ -963,7 +973,7 @@ function showWelcome(syncHash = true) {
 }
 
 function showUpload(syncHash = true) {
-  if (!canUseUpload()) {
+  if (!currentSession) {
     showRepositoryList(true);
     return;
   }
@@ -3263,6 +3273,12 @@ function renderUpload() {
     select.value = uploadRepos[0].name;
   }
   renderUploadFields();
+  if (uploadRepos.length === 0) {
+    select.innerHTML = '<option value="">No repositories available</option>';
+    select.disabled = true;
+    document.getElementById("upload-fields").innerHTML =
+      `<div class="muted-row upload-empty" role="note">${escapeHtml(uploadEmptyStateMessage())}</div>`;
+  }
   updateUploadPath();
 }
 

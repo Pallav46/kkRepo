@@ -571,13 +571,14 @@ function canShowUploadNav() {
   return Boolean(currentSession && hasUploadPermission());
 }
 
-function uploadEmptyStateMessage(hasPermission) {
-  if (!hasPermission) {
-    return "You do not have permission to upload. Ask an administrator for add access to a hosted repository.";
-  }
-  return "No repository is available for web upload. Create an online hosted repository in a format "
-    + "that supports upload (for example Raw, Maven, npm or PyPI). Docker images are pushed with "
-    + "\"docker push\" instead.";
+// Deliberately neutral: the Upload entry is gated on add/create permissions, while the backend
+// lists a repository as uploadable only when the account may edit it, so the page cannot tell
+// a missing repository from a missing permission and must not recommend a specific grant.
+function uploadEmptyStateMessage() {
+  return "No repository is available for web upload with your current account. Web upload needs an "
+    + "online hosted repository in a format that supports it (for example Raw, Maven, npm or PyPI) "
+    + "and permission to edit it; ask an administrator if you expect one. Docker images are pushed "
+    + "with \"docker push\" instead.";
 }
 
 function updateTopbarAuth() {
@@ -3276,7 +3277,7 @@ function renderUpload() {
     select.innerHTML = '<option value="">No repositories available</option>';
     select.disabled = true;
     document.getElementById("upload-fields").innerHTML =
-      `<div class="muted-row upload-empty" role="note">${escapeHtml(uploadEmptyStateMessage(hasUploadPermission()))}</div>`;
+      `<div class="muted-row upload-empty" role="note">${escapeHtml(uploadEmptyStateMessage())}</div>`;
   }
   updateUploadPath();
 }

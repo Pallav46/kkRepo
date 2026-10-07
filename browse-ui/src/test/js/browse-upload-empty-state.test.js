@@ -89,18 +89,44 @@ test("only offers the Upload navigation to signed-in users with upload permissio
   }).context.canShowUploadNav(), true);
 });
 
-test("explains why nothing can be uploaded", () => {
+test("empty-state message does not recommend a specific permission grant", () => {
   const { context } = loadUploadHelpers();
+  const message = context.uploadEmptyStateMessage();
 
-  assert.match(context.uploadEmptyStateMessage(true), /No repository is available for web upload/);
-  assert.match(context.uploadEmptyStateMessage(true), /docker push/);
-  assert.match(context.uploadEmptyStateMessage(false), /do not have permission to upload/);
+  assert.match(message, /No repository is available for web upload/);
+  assert.match(message, /permission to edit it/);
+  assert.match(message, /docker push/);
+  assert.doesNotMatch(message, /add access/i);
+});
+
+function loadWithRealPermissions(permissions) {
+  const context = vm.createContext({ currentSession: { userId: "u" }, currentPermissions: permissions });
+  vm.runInContext(
+    ["permissionPartMatches", "permissionMatches", "can", "hasUploadPermission",
+      "hasRepositoryUploadPermission", "canShowUploadNav", "uploadEmptyStateMessage"]
+      .map(extractFunction).join("\n")
+      + "\nglobalThis.canShowUploadNav = canShowUploadNav;"
+      + "\nglobalThis.uploadEmptyStateMessage = uploadEmptyStateMessage;",
+    context,
+  );
+  return context;
+}
+
+test("add-only and create-only accounts get the Upload entry but no misleading grant advice", () => {
+  // The backend lists uploadable repositories only for accounts that can EDIT them, so these
+  // accounts reach the empty state even when a hosted Raw repository exists.
+  for (const permissions of [["nexus:repository-view:raw:artifacts:add"], ["nexus:component:create"]]) {
+    const context = loadWithRealPermissions(permissions);
+    assert.equal(context.canShowUploadNav(), true);
+    assert.doesNotMatch(context.uploadEmptyStateMessage(), /add access|create an online hosted/i);
+  }
+  assert.equal(loadWithRealPermissions(["nexus:repository-view:raw:artifacts:read"]).canShowUploadNav(), false);
 });
 
 test("renders the empty-state message instead of an empty upload form", () => {
   const renderUpload = extractFunction("renderUpload");
 
   assert.match(renderUpload, /uploadRepos\.length === 0/);
-  assert.match(renderUpload, /uploadEmptyStateMessage\(hasUploadPermission\(\)\)/);
+  assert.match(renderUpload, /uploadEmptyStateMessage\(\)/);
   assert.match(renderUpload, /No repositories available/);
 });

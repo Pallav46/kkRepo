@@ -4,6 +4,12 @@ All notable public changes to kkrepo are documented in this file.
 
 This project follows a pragmatic release process. Stable releases call out migration impact, compatibility changes, operational notes, and any known behavior changes in their release section.
 
+## Unreleased
+
+### Added
+
+- Proxy repositories can opt into public HTTPS content GET/HEAD redirects with a standalone `*` in `proxy.allowedRedirectHosts`. The existing editor, exact/domain rules and strict default remain. Public-address validation, DNS pinning, TLS, downgrade rejection and credential/cookie isolation are enforced independently; POST and authentication exchanges retain strict rules, including Hugging Face and Conan integration paths. (#384)
+
 ## 1.2.1 - 2026-10-04
 
 ### Added

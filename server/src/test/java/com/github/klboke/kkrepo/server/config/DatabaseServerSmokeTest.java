@@ -114,6 +114,8 @@ class DatabaseServerSmokeTest {
       assertEquals("UP", second.getBean(HealthEndpoint.class).health().getStatus().getCode());
 
       exerciseSharedApplicationFlows(first, second);
+      com.github.klboke.kkrepo.server.npm.NpmHostedPublicationSmokeSupport.verify(first, second);
+      com.github.klboke.kkrepo.server.npm.NpmHostedPublicationSmokeSupport.verifyDeadlockRetry(first, second);
 
       @SuppressWarnings("unchecked")
       FindByIndexNameSessionRepository<Session> firstSessions =

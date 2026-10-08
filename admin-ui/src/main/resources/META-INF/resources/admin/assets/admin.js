@@ -17,6 +17,8 @@ let blobStores = [];
 let blobStoreUsage;
 let blobStoreLoadVersion = 0;
 let blobStoreSort = { key: "name", direction: "asc" };
+let blobActionMenuStoreId = null;
+let blobActionMenuTrigger = null;
 let cleanupPolicies = [];
 let cleanupCapabilities = [];
 let cleanupRuns = [];
@@ -1492,6 +1494,11 @@ function toggleBlobStoreSort(key) {
 }
 
 function renderBlobStores() {
+  const actionMenu = document.getElementById("blobstore-action-menu");
+  const focusedTriggerId = actionMenu?.contains(document.activeElement)
+    ? actionMenu.getAttribute("aria-labelledby")
+    : document.activeElement?.closest?.(".blobstore-more-actions")?.id;
+  closeBlobStoreActionMenu();
   updateTableSortHeaders("blobstore", blobStoreSort);
   const filtered = filteredBlobStores();
   renderUsageSummary("blobstore", filtered, blobStoreUsage);
@@ -1513,16 +1520,16 @@ function renderBlobStores() {
         <td class="usage-location">${renderCopyableLocation(target, "Copy storage location")}
           ${detail && detail !== target ? `<div class="usage-secondary">${renderCopyableLocation(detail, "Copy storage location")}</div>` : ""}
           ${fileStore ? "" : pathStyleBadge(Boolean(store.pathStyleAccess))}</td>
-        <td class="actions-column">
+        <td class="actions-column"><div class="cleanup-policy-actions">
           ${store.id == null ? '<span class="health-muted">-</span>' : `
-            <button class="row-action store-repositories-button" data-store-name="${escapeHtml(store.name)}" type="button">Repositories</button>
-            <button class="row-action edit-blobstore-button" data-id="${store.id}" type="button">edit</button>
-            <button class="row-action check-blobstore-button" data-id="${store.id}" data-name="${escapeHtml(store.name)}" type="button">check</button>
+            <button class="row-action edit-blobstore-button" data-id="${store.id}" type="button">Edit</button>
+            <button class="row-action cleanup-policy-more-actions blobstore-more-actions" id="blobstore-more-actions-${store.id}" data-id="${store.id}" type="button" aria-label="More actions for ${escapeHtml(store.name)}" aria-haspopup="menu" aria-controls="blobstore-action-menu" aria-expanded="false" title="More actions"><span aria-hidden="true">⋯</span></button>
           `}
-        </td>
+        </div></td>
       </tr>
     `;
   }).join("") || '<tr><td colspan="9" class="placeholder">No blob stores found.</td></tr>';
+  if (focusedTriggerId) document.getElementById(focusedTriggerId)?.focus();
 }
 
 function renderCopyableLocation(value, copyLabel) {
@@ -2074,9 +2081,6 @@ async function responseErrorMessage(response) {
     window.location.href = authRequiredWelcome();
     return "Authentication required.";
   }
-  if (response.status === 409) {
-    return "Name already exists.";
-  }
   try {
     const text = await response.text();
     if (!text) return `HTTP ${response.status}`;
@@ -2127,6 +2131,113 @@ async function saveBlobStore(event) {
 async function checkBlobStore(id, name) {
   const store = blobStores.find((item) => String(item.id) === String(id)) || { id, name };
   await runBlobStoreCheck(store, { toast: true });
+}
+
+async function deleteBlobStore(id) {
+  const store = blobStores.find((item) => String(item.id) === String(id));
+  if (!store || !confirm(`Delete blob store "${store.name}"? This removes the configuration only. Storage files and buckets are not deleted.`)) return;
+  showToast(`Deleting blob store ${store.name}...`);
+  try {
+    const response = await fetch(`/internal/blob-stores/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    await loadBlobStores();
+    showToast(`Blob store ${store.name} deleted.`, "ok");
+  } catch (error) {
+    showToast(`Delete failed: ${error.message}`, "error");
+  }
+}
+
+function showBlobStoreRepositories(name) {
+  const select = document.getElementById("repository-store-filter");
+  select.innerHTML = `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`;
+  select.value = name;
+  document.getElementById("repository-filter").value = "";
+  repositorySort = { key: "totalBytes", direction: "desc" };
+  switchView("repositories");
+}
+
+function blobActionMenuItems() {
+  return Array.from(document.querySelectorAll("#blobstore-action-menu [role='menuitem']"));
+}
+
+function positionBlobStoreActionMenu() {
+  const menu = document.getElementById("blobstore-action-menu");
+  const trigger = blobActionMenuTrigger;
+  if (!trigger?.isConnected || menu.hidden) return;
+  const triggerRect = trigger.getBoundingClientRect();
+  if (triggerRect.bottom < 0 || triggerRect.top > window.innerHeight) {
+    closeBlobStoreActionMenu();
+    return;
+  }
+  const menuRect = menu.getBoundingClientRect();
+  const padding = 10, gap = 6;
+  menu.style.left = `${Math.round(Math.max(padding, Math.min(
+    triggerRect.right - menuRect.width, window.innerWidth - menuRect.width - padding)))}px`;
+  const above = triggerRect.top - menuRect.height - gap;
+  menu.style.top = `${Math.round(triggerRect.bottom + menuRect.height + gap > window.innerHeight - padding
+    && above >= padding ? above : triggerRect.bottom + gap)}px`;
+}
+
+function closeBlobStoreActionMenu(options = {}) {
+  const menu = document.getElementById("blobstore-action-menu");
+  const trigger = blobActionMenuTrigger;
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  blobActionMenuStoreId = null;
+  blobActionMenuTrigger = null;
+  menu.hidden = true;
+  menu.setAttribute("aria-hidden", "true");
+  menu.removeAttribute("aria-labelledby");
+  menu.innerHTML = "";
+  if (options.restoreFocus && trigger?.isConnected) trigger.focus();
+}
+
+function openBlobStoreActionMenu(id, trigger, focusTarget = null) {
+  const store = blobStores.find((item) => String(item.id) === String(id));
+  if (!store) return;
+  const menu = document.getElementById("blobstore-action-menu");
+  if (!menu.hidden && String(blobActionMenuStoreId) === String(id)) {
+    if (focusTarget === "first") blobActionMenuItems()[0]?.focus();
+    else if (focusTarget === "last") blobActionMenuItems().at(-1)?.focus();
+    else closeBlobStoreActionMenu({ restoreFocus: true });
+    return;
+  }
+  closeBlobStoreActionMenu();
+  closeCleanupPolicyActionMenu();
+  blobActionMenuStoreId = id;
+  blobActionMenuTrigger = trigger;
+  menu.innerHTML = `
+    <button class="cleanup-policy-action-menu-item" data-blobstore-action="repositories" type="button" role="menuitem">Repositories</button>
+    <button class="cleanup-policy-action-menu-item" data-blobstore-action="check" type="button" role="menuitem">Check</button>
+    <div class="cleanup-policy-action-menu-separator" role="separator"></div>
+    <button class="cleanup-policy-action-menu-item is-danger" data-blobstore-action="delete" type="button" role="menuitem">Delete blob store</button>`;
+  trigger.setAttribute("aria-expanded", "true");
+  menu.setAttribute("aria-hidden", "false");
+  menu.setAttribute("aria-labelledby", trigger.id);
+  menu.hidden = false;
+  positionBlobStoreActionMenu();
+  if (focusTarget === "first") blobActionMenuItems()[0]?.focus();
+  if (focusTarget === "last") blobActionMenuItems().at(-1)?.focus();
+}
+
+function handleBlobStoreActionMenuKeydown(event) {
+  const menu = document.getElementById("blobstore-action-menu");
+  if (menu.hidden || !menu.contains(event.target)) return false;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeBlobStoreActionMenu({ restoreFocus: true });
+    return true;
+  }
+  const items = blobActionMenuItems();
+  const current = items.indexOf(document.activeElement);
+  let next = null;
+  if (event.key === "ArrowDown") next = (current + 1) % items.length;
+  if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+  if (event.key === "Home") next = 0;
+  if (event.key === "End") next = items.length - 1;
+  if (next == null) return false;
+  event.preventDefault();
+  items[next]?.focus();
+  return true;
 }
 
 // ---- Repository form -----------------------------------------------------
@@ -6651,6 +6762,7 @@ function openCleanupPolicyActionMenu(policyId, trigger, focusTarget = null) {
     return;
   }
   closeCleanupPolicyActionMenu();
+  closeBlobStoreActionMenu();
   cleanupActionMenuPolicyId = numericPolicyId;
   cleanupActionMenuTrigger = trigger;
   const executeSupported = Boolean(view.capability?.executeSupported);
@@ -7984,14 +8096,6 @@ document.getElementById("blobstore-table").addEventListener("click", (event) => 
     copyLocationValue(copyButton);
     return;
   }
-  const button = event.target.closest(".store-repositories-button");
-  if (!button) return;
-  const select = document.getElementById("repository-store-filter");
-  select.innerHTML = `<option value="${escapeHtml(button.dataset.storeName)}">${escapeHtml(button.dataset.storeName)}</option>`;
-  select.value = button.dataset.storeName;
-  document.getElementById("repository-filter").value = "";
-  repositorySort = { key: "totalBytes", direction: "desc" };
-  switchView("repositories");
 });
 document.addEventListener("click", (event) => {
   const sortButton = event.target.closest("[data-repository-sort]");
@@ -8026,13 +8130,20 @@ document.addEventListener("click", (event) => {
   const actionMenu = document.getElementById("cleanup-policy-action-menu");
   if (!actionMenu.hidden
       && !actionMenu.contains(event.target)
-      && !event.target.closest(".cleanup-policy-more-actions")) {
+      && !event.target.closest(".cleanup-policy-more-actions:not(.blobstore-more-actions)")) {
     closeCleanupPolicyActionMenu();
+  }
+  const blobMenu = document.getElementById("blobstore-action-menu");
+  if (!blobMenu.hidden
+      && !blobMenu.contains(event.target)
+      && !event.target.closest(".blobstore-more-actions")) {
+    closeBlobStoreActionMenu();
   }
 });
 document.addEventListener("keydown", (event) => {
   if (handleFormModalKeydown(event)) return;
   if (handleCleanupPolicyActionMenuKeydown(event)) return;
+  if (handleBlobStoreActionMenuKeydown(event)) return;
   if (event.key === "Escape") closeUserMenu();
 });
 document.getElementById("create-blobstore-button").addEventListener("click", showCreateBlobStoreForm);
@@ -8050,10 +8161,41 @@ document.getElementById("blobstore-table").addEventListener("click", (event) => 
     showEditBlobStoreForm(editButton.dataset.id);
     return;
   }
-  const checkButton = event.target.closest(".check-blobstore-button");
-  if (!checkButton) return;
-  checkBlobStore(checkButton.dataset.id, checkButton.dataset.name);
+  const moreButton = event.target.closest(".blobstore-more-actions");
+  if (moreButton) {
+    openBlobStoreActionMenu(moreButton.dataset.id, moreButton, event.detail === 0 ? "first" : null);
+  }
 });
+document.getElementById("blobstore-table").addEventListener("keydown", (event) => {
+  const moreButton = event.target.closest(".blobstore-more-actions");
+  if (!moreButton || !["ArrowDown", "ArrowUp"].includes(event.key)) return;
+  event.preventDefault();
+  openBlobStoreActionMenu(moreButton.dataset.id, moreButton,
+    event.key === "ArrowDown" ? "first" : "last");
+});
+document.getElementById("blobstore-action-menu").addEventListener("click", (event) => {
+  const item = event.target.closest("[data-blobstore-action]");
+  if (!item || blobActionMenuStoreId == null) return;
+  const id = blobActionMenuStoreId;
+  const store = blobStores.find((entry) => String(entry.id) === String(id));
+  const action = item.dataset.blobstoreAction;
+  closeBlobStoreActionMenu({ restoreFocus: true });
+  if (!store) return;
+  if (action === "repositories") showBlobStoreRepositories(store.name);
+  if (action === "check") checkBlobStore(id, store.name);
+  if (action === "delete") deleteBlobStore(id);
+});
+document.getElementById("blobstore-action-menu").addEventListener("focusout", () => {
+  setTimeout(() => {
+    const menu = document.getElementById("blobstore-action-menu");
+    if (!menu.contains(document.activeElement)
+        && document.activeElement !== blobActionMenuTrigger) {
+      closeBlobStoreActionMenu();
+    }
+  }, 0);
+});
+document.addEventListener("scroll", () => positionBlobStoreActionMenu(), true);
+window.addEventListener("resize", positionBlobStoreActionMenu);
 
 document.getElementById("create-repository-button").addEventListener("click", showCreateRepositoryForm);
 document.getElementById("cancel-repository-button").addEventListener("click", hideRepositoryForm);

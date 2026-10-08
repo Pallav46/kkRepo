@@ -4,12 +4,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.argThat;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 
 import com.github.klboke.kkrepo.persistence.jdbc.api.StorageStatisticsDao.BlobStoreUsage;
 import com.github.klboke.kkrepo.persistence.jdbc.api.StorageStatisticsDao;
@@ -43,6 +45,26 @@ import org.springframework.web.server.ResponseStatusException;
 class BlobStoresControllerTest {
   @TempDir
   Path tempDir;
+
+  @Test
+  void deleteEndpointReturnsNoContentOrAUsefulConflict() throws Exception {
+    BlobStoresController controller = new BlobStoresController(new EmptyBlobStoreDao(),
+        null, null, null, null, new S3StorageProperties(), null, null);
+    BlobStoreDeletionService service = mock(BlobStoreDeletionService.class);
+    controller.setBlobStoreDeletionService(service);
+    var mvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+    mvc.perform(delete("/internal/blob-stores/7"))
+        .andExpect(status().isNoContent());
+    verify(service).deleteEmpty(7);
+
+    org.mockito.Mockito.doThrow(new ResponseStatusException(HttpStatus.CONFLICT,
+        "Blob store is still used by a repository")).when(service).deleteEmpty(8);
+    mvc.perform(delete("/internal/blob-stores/8"))
+        .andExpect(status().isConflict())
+        .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+        .andExpect(jsonField("message", "Blob store is still used by a repository"));
+  }
 
   @Test
   void usageEndpointUsesCatalogWithoutProbingObjectStorage() throws Exception {

@@ -39,6 +39,9 @@ import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.GroupSett
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.HostedSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.ProxySettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.PypiSettings;
+import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.YumSettings;
+import com.github.klboke.kkrepo.server.yum.YumMetadataDepth;
+import com.github.klboke.kkrepo.persistence.jdbc.api.RepositoryIndexRebuildDao;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.RawSettings;
 import com.github.klboke.kkrepo.server.repositories.RepositoryCommands.UpdateCommand;
 import com.github.klboke.kkrepo.server.security.OutboundRequestPolicy;
@@ -102,6 +105,12 @@ public class RepositoryService {
   private RRegistryDao rRegistry;
   private HuggingFaceRegistryDao huggingFaceRegistry;
   private CleanupPolicyDao cleanupPolicies;
+  private RepositoryIndexRebuildDao indexRebuildDao;
+
+  @Autowired
+  void setIndexRebuildDao(RepositoryIndexRebuildDao indexRebuildDao) {
+    this.indexRebuildDao = indexRebuildDao;
+  }
   private final String urlPrefix;
   private final int serverPort;
   private final int managementPort;
@@ -316,6 +325,10 @@ public class RepositoryService {
       attributes.put("pypi", pypiAttributes(pypi));
     }
 
+    if (recipe.format() == RepositoryFormat.YUM && recipe.type() == RepositoryType.HOSTED) {
+      attributes.put("yum", Map.of("repodataDepth", yumDepth(command.yum(), 0)));
+    }
+
     String versionPolicy = null;
     String layoutPolicy = null;
     String writePolicy = null;
@@ -435,6 +448,16 @@ public class RepositoryService {
       attributes.put("pypi", pypiAttributes(merged));
     }
 
+    boolean rebuildYumMetadata = false;
+    if (recipe.format() == RepositoryFormat.YUM && existing.type() == RepositoryType.HOSTED) {
+      int currentDepth = YumMetadataDepth.read(existing.attributes());
+      int depth = yumDepth(command.yum(), currentDepth);
+      boolean initialized = attributes.get("yum") instanceof Map<?, ?> yum
+          && yum.get("repodataDepth") != null;
+      rebuildYumMetadata = !initialized || depth != currentDepth;
+      attributes.put("yum", Map.of("repodataDepth", depth));
+    }
+
     String versionPolicy = existing.versionPolicy();
     String layoutPolicy = existing.layoutPolicy();
     String writePolicy = existing.writePolicy();
@@ -467,6 +490,11 @@ public class RepositoryService {
         online, blobStoreId, existing.routingRuleId(), proxyRemoteUrl,
         versionPolicy, layoutPolicy, writePolicy, strict, attributes);
     repositoryDao.update(toUpdate);
+    if (rebuildYumMetadata && indexRebuildDao != null) {
+      // First initialization repairs legacy repositories; later saves rebuild only on depth changes.
+      // The durable marker commits with the settings and is claimed by one replica.
+      indexRebuildDao.enqueue(existing.id(), RepositoryIndexRebuildDao.YUM_METADATA);
+    }
     if (recipe.format() == RepositoryFormat.APT && aptRegistry != null) {
       AptSettings settings = readAptAttributes(toUpdate);
       if (settings.distribution() != null && !settings.distribution().isBlank()) {
@@ -1175,7 +1203,9 @@ public class RepositoryService {
         record.id(), record.name(), record.recipeName(),
         record.format(), record.type(), record.online(),
         blobStoreName, record.strictContentTypeValidation(), url,
-        hosted, proxy, raw, docker, cargo, group, apt, alpine, pypi);
+        hosted, proxy, raw, docker, cargo, group, apt, alpine, pypi,
+        record.format() == RepositoryFormat.YUM && record.type() == RepositoryType.HOSTED
+            ? new YumSettings(YumMetadataDepth.read(record.attributes())) : null);
   }
 
   private Map<Long, String> blobStoreNameIndex() {
@@ -1657,6 +1687,12 @@ public class RepositoryService {
     RawSettings effective = raw == null ? new RawSettings("ATTACHMENT") : raw;
     String disposition = normalizeRawContentDisposition(effective.contentDisposition());
     return Map.of("contentDisposition", disposition);
+  }
+
+  private static int yumDepth(YumSettings settings, int fallback) {
+    int depth = settings == null || settings.repodataDepth() == null ? fallback : settings.repodataDepth();
+    if (depth < 0) throw new RepositoryValidationException("Yum repodata depth must be non-negative");
+    return depth;
   }
 
   private static PypiSettings normalizePypi(PypiSettings settings) {

@@ -4,8 +4,6 @@ All notable public changes to kkrepo are documented in this file.
 
 This project follows a pragmatic release process. Stable releases call out migration impact, compatibility changes, operational notes, and any known behavior changes in their release section.
 
-## Unreleased
-
 ## 1.3.0 - 2026-10-08
 
 ### Added
